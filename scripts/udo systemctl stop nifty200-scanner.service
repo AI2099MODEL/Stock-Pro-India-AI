@@ -1,0 +1,8 @@
+● nifty200-scanner.service - Nifty200 Breakout Scanner
+     Loaded: loaded (/etc/systemd/system/nifty200-scanner.service; enabled; vendor preset: enabled)
+     Active: activating (auto-restart) (Result: exit-code) since Mon 2026-08-17 04:51:56 UTC; 1s ago
+    Process: 38270 ExecStart=/usr/bin/python3 /home/ubuntu/Stock-Pro-India/nifty200_scanner.py [0;1;31m(code=exited, status=2)[0m
+   Main PID: 38270 (code=exited, status=2)
+
+Aug 17 04:51:56 instance-20260815-1257 systemd[1]: [0;1;39m[0;1;31m[0;1;39mnifty200-scanner.service: Main process exited, code=exited, status=2/INVALIDARGUMENT[0m
+Aug 17 04:51:56 instance-20260815-1257 systemd[1]: [0;1;38;5;185m[0;1;39m[0;1;38;5;185mnifty200-scanner.service: Failed with result 'exit-code'.[0m

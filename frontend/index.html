@@ -1,0 +1,877 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Institutional AI Portfolio & Trading Terminal</title>
+  <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
+  <meta http-equiv="Pragma" content="no-cache">
+  <meta http-equiv="Expires" content="0">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+  <style>
+    :root {
+      --bg-app: #F4F6F9;
+      --bg-card: #FFFFFF;
+      --bg-subtle: #F8FAFC;
+      --border-subtle: #E2E8F0;
+      --border-card: #E5E7EB;
+      --border-active: #2563EB;
+      --text-main: #0F172A;
+      --text-muted: #64748B;
+      --text-dim: #94A3B8;
+      --color-green: #10B981;
+      --color-red: #EF4444;
+      --color-blue: #2563EB;
+      --font-sans: 'Plus Jakarta Sans', -apple-system, BlinkMacSystemFont, sans-serif;
+      --font-mono: 'JetBrains Mono', monospace;
+      --radius-sm: 6px;
+      --radius-md: 10px;
+      --radius-lg: 14px;
+      --shadow-sm: 0 1px 3px rgba(0, 0, 0, 0.04);
+      --shadow-card: 0 2px 10px rgba(0, 0, 0, 0.04);
+    }
+    * { margin:0; padding:0; box-sizing:border-box; }
+    body {
+      background-color: var(--bg-app);
+      color: var(--text-main);
+      font-family: var(--font-sans);
+      font-size: 13px;
+      line-height: 1.5;
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+    }
+    /* Header */
+    .hero-navbar {
+      background: #0B0F19;
+      color: #FFFFFF;
+      padding: 10px 24px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+      flex-wrap: wrap;
+      gap: 10px;
+    }
+    .nav-brand { display:flex; align-items:center; gap:10px; }
+    .brand-icon {
+      width: 28px; height: 28px;
+      background: linear-gradient(135deg, #10B981 0%, #059669 100%);
+      border-radius: 6px;
+      display: flex; align-items: center; justify-content: center;
+      font-weight: 800; font-size: 14px; color: #FFFFFF;
+    }
+    .nav-links { display: flex; align-items: center; gap: 4px; }
+    .nav-link-btn {
+      background: transparent; border: none; color: #94A3B8;
+      padding: 6px 14px; border-radius: 16px; font-size: 12px;
+      font-weight: 600; cursor: pointer; transition: all 0.15s ease;
+    }
+    .nav-link-btn:hover { color: #FFFFFF; background: rgba(255, 255, 255, 0.08); }
+    .nav-link-btn.active { color: #FFFFFF; background: #2563EB; font-weight: 700; }
+    
+    /* Single-Line Shoonya Token Feeder */
+    .single-line-token-bar {
+      background: #0F172A;
+      border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+      padding: 8px 24px;
+      display: flex; align-items: center; justify-content: space-between; gap: 14px;
+      flex-wrap: wrap;
+    }
+    .token-input-wrapper {
+      display: flex; align-items: center; flex: 1; min-width: 280px;
+      background: rgba(255, 255, 255, 0.06);
+      border: 1px solid rgba(255, 255, 255, 0.15);
+      border-radius: 20px; padding: 4px 12px; gap: 8px;
+    }
+    .token-input-wrapper input {
+      background: transparent; border: none; outline: none;
+      color: #FFFFFF; font-family: var(--font-mono); font-size: 11px; flex: 1;
+    }
+    .btn-feed-token {
+      background: #10B981; color: #FFFFFF; border: none;
+      padding: 5px 14px; border-radius: 14px; font-size: 11px;
+      font-weight: 700; cursor: pointer; transition: background 0.2s; white-space: nowrap;
+    }
+    .btn-feed-token:hover { background: #059669; }
+
+    /* Compact Profit Bar */
+    .hero-kpi-bar {
+      background: #0B0F19; color: #FFFFFF;
+      padding: 12px 24px;
+      display: grid; grid-template-columns: repeat(4, 1fr) auto;
+      gap: 16px; align-items: center;
+      border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+    }
+    .kpi-card-mini { display: flex; flex-direction: column; gap: 2px; }
+    .kpi-label-mini { font-size: 10px; font-weight: 700; color: #94A3B8; text-transform: uppercase; }
+    .kpi-val-mini { font-size: 18px; font-weight: 800; font-family: var(--font-mono); }
+    .kpi-sub-mini { font-size: 10px; font-weight: 600; }
+
+    /* Ticker Tape */
+    .ticker-ribbon {
+      background: #FFFFFF; border-bottom: 1px solid var(--border-subtle);
+      display: flex; align-items: center; overflow-x: auto;
+      padding: 0 16px; height: 38px; gap: 8px; flex-shrink: 0;
+    }
+    .ticker-chip {
+      display: flex; align-items: center; gap: 8px;
+      padding: 4px 10px; border-radius: 6px; background: #F8FAFC;
+      border: 1px solid var(--border-subtle); cursor: pointer; white-space: nowrap;
+      font-size: 11px; font-family: var(--font-mono); font-weight: 700;
+    }
+    .ticker-chip.active { border-color: #2563EB; background: #EFF6FF; }
+
+    /* Main Container & Tabs */
+    .tab-view-container { padding: 16px 24px; flex: 1; display: none; }
+    .tab-view-container.active { display: block; }
+    
+    .overview-grid {
+      display: grid; grid-template-columns: 1.35fr 1fr;
+      gap: 16px;
+    }
+    .card-box {
+      background: #FFFFFF; border: 1px solid var(--border-card);
+      border-radius: var(--radius-md); padding: 16px;
+      box-shadow: var(--shadow-card);
+    }
+    .card-header {
+      display: flex; align-items: center; justify-content: space-between;
+      margin-bottom: 12px; padding-bottom: 8px; border-bottom: 1px solid var(--border-subtle);
+    }
+    .card-title { font-size: 13px; font-weight: 800; color: #0F172A; display: flex; align-items: center; gap: 6px; }
+
+    /* Data Table */
+    .terminal-table { width: 100%; border-collapse: collapse; font-size: 11px; }
+    .terminal-table th {
+      text-align: left; padding: 8px 10px; color: var(--text-muted);
+      font-weight: 700; border-bottom: 1px solid var(--border-subtle);
+      text-transform: uppercase; font-size: 10px;
+    }
+    .terminal-table td { padding: 8px 10px; border-bottom: 1px solid #F1F5F9; font-family: var(--font-mono); }
+    .terminal-table tr:hover { background: #F8FAFC; }
+
+    /* Val Colors */
+    .val-green { color: var(--color-green) !important; }
+    .val-red { color: var(--color-red) !important; }
+
+    /* Timeframe Group */
+    .tf-group { display: flex; gap: 2px; background: #F1F5F9; padding: 2px; border-radius: 6px; }
+    .tf-btn {
+      background: transparent; border: none; font-size: 10px; font-weight: 700;
+      color: var(--text-muted); padding: 3px 8px; border-radius: 4px; cursor: pointer;
+    }
+    .tf-btn.active { background: #FFFFFF; color: #2563EB; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }
+
+    /* Sub-tabs */
+    .sub-tabs { display: flex; gap: 6px; margin-bottom: 12px; flex-wrap: wrap; }
+    .sub-tab-btn {
+      background: #F1F5F9; border: 1px solid var(--border-subtle); color: var(--text-muted);
+      padding: 5px 12px; border-radius: 12px; font-size: 11px; font-weight: 700; cursor: pointer;
+    }
+    .sub-tab-btn.active { background: #2563EB; color: #FFFFFF; border-color: #2563EB; }
+
+    /* Canvas Chart Container */
+    .canvas-chart-wrapper {
+      width: 100%;
+      height: 320px;
+      position: relative;
+      background: #FFFFFF;
+      border: 1px solid var(--border-subtle);
+      border-radius: var(--radius-sm);
+      overflow: hidden;
+    }
+    .canvas-chart-wrapper canvas {
+      position: absolute;
+      top: 0; left: 0;
+      width: 100%; height: 100%;
+      display: block;
+    }
+  </style>
+</head>
+<body>
+
+  <!-- 1. Sleek Navbar with Active Tab Switcher -->
+  <header class="hero-navbar">
+    <div class="nav-brand">
+      <div class="brand-icon">◈</div>
+      <div style="font-weight:800; font-size:15px;">
+        Stock Pro India <span style="font-weight:500; color:#94A3B8; font-size:12px;">AI Terminal</span>
+      </div>
+    </div>
+    <nav class="nav-links">
+      <button class="nav-link-btn" data-tab="tabLoginGateway">🔑 Broker Login</button>
+      <button class="nav-link-btn active" data-tab="tabOverview">📊 Overview</button>
+      <button class="nav-link-btn" data-tab="tabDhan">📈 Dhan Portfolio</button>
+      <button class="nav-link-btn" data-tab="tabMcx">⚡ MCX Live Grid</button>
+      <button class="nav-link-btn" data-tab="tabOracle">🎯 Breakout Signals</button>
+      <button class="nav-link-btn" data-tab="tabLedger">📜 Trade Ledger</button>
+    </nav>
+
+    <div style="display:flex; align-items:center; gap:8px; flex-wrap:wrap;">
+      <button class="nav-link-btn" data-tab="tabLoginGateway" style="background:rgba(37,99,235,0.2); border:1px solid #2563EB; color:#60A5FA; font-size:11px; padding:4px 10px; font-weight:700;">
+        ⚙️ Broker Gateway
+      </button>
+
+      <!-- Shoonya Finvasia Status -->
+      <div id="statusShoonyaBadge" style="display:flex; align-items:center; gap:6px; background:rgba(16, 185, 129, 0.15); border:1px solid rgba(16, 185, 129, 0.3); padding:4px 9px; border-radius:16px; font-size:10px; font-weight:700; color:#10B981;">
+        <span id="shoonyaDot" style="width:6px; height:6px; border-radius:50%; background:#10B981; box-shadow:0 0 5px #10B981;"></span>
+        <span id="shoonyaStatusText">Shoonya: Live</span>
+      </div>
+
+      <!-- Dhan HQ Status -->
+      <div id="statusDhanBadge" style="display:flex; align-items:center; gap:6px; background:rgba(37, 99, 235, 0.15); border:1px solid rgba(37, 99, 235, 0.3); padding:4px 9px; border-radius:16px; font-size:10px; font-weight:700; color:#60A5FA;">
+        <span id="dhanDot" style="width:6px; height:6px; border-radius:50%; background:#3B82F6; box-shadow:0 0 5px #3B82F6;"></span>
+        <span id="dhanStatusText">Dhan: Live</span>
+      </div>
+
+      <!-- Yahoo Finance Real-time Engine (Always Active) -->
+      <div id="statusYfBadge" style="display:flex; align-items:center; gap:6px; background:rgba(16, 185, 129, 0.12); border:1px solid rgba(16, 185, 129, 0.25); padding:4px 9px; border-radius:16px; font-size:10px; font-weight:700; color:#10B981;" title="Nifty 200 Real-Time Continuous Fallback Engine">
+        <span style="width:6px; height:6px; border-radius:50%; background:#10B981; box-shadow:0 0 5px #10B981;"></span>
+        <span id="yfStatusText">Yahoo Finance: Active (Nifty 200)</span>
+      </div>
+    </div>
+  </header>
+
+  <!-- 3. Compact Real Profit & Risk Bar (Zero Fake Profit Seeds) -->
+  <section class="hero-kpi-bar">
+    <div class="kpi-card-mini">
+      <div class="kpi-label-mini">Realized Net PnL</div>
+      <div class="kpi-val-mini val-green" id="heroRealizedPnl">+₹0.00</div>
+      <div class="kpi-sub-mini" style="color:#94A3B8;">Today's Closed Trades</div>
+    </div>
+    <div class="kpi-card-mini">
+      <div class="kpi-label-mini">Active Open Trades</div>
+      <div class="kpi-val-mini" id="heroActiveTradesCount" style="color:#FFFFFF;">0</div>
+      <div class="kpi-sub-mini" style="color:#94A3B8;">Live Market Positions</div>
+    </div>
+    <div class="kpi-card-mini">
+      <div class="kpi-label-mini">Unrealized Open PnL</div>
+      <div class="kpi-val-mini val-green" id="heroUnrealizedPnl">+₹0.00</div>
+      <div class="kpi-sub-mini" style="color:#94A3B8;">Real-Time Mark to Market</div>
+    </div>
+    <div class="kpi-card-mini">
+      <div class="kpi-label-mini">Active Deployed Capital</div>
+      <div class="kpi-val-mini" id="heroDeployedCapital" style="color:#60A5FA;">₹0.00</div>
+      <div class="kpi-sub-mini" style="color:#94A3B8;">Margin In Use</div>
+    </div>
+    <div style="display:flex; align-items:center; gap:8px;">
+      <span class="badge-oracle" style="background:#2563EB; color:#FFF; padding:6px 12px; border-radius:6px; font-weight:800; font-size:11px;">
+        🤖 AI CONFLUENCE ACTIVE
+      </span>
+    </div>
+  </section>
+
+  <!-- Real-Time Ticker Ribbon -->
+  <div class="ticker-ribbon" id="tickerRibbon">
+    <!-- Populated dynamically via app.js -->
+  </div>
+
+  <!-- ================================================================= -->
+  <!-- TAB 0: BROKER LOGIN & CONNECTIVITY GATEWAY -->
+  <!-- ================================================================= -->
+  <main class="tab-view-container" id="tabLoginGateway">
+    <div style="max-width: 1000px; margin: 0 auto; display: flex; flex-direction: column; gap: 20px;">
+      
+      <div style="background:#FFFFFF; border:1px solid var(--border-card); border-radius:12px; padding:20px; box-shadow:var(--shadow-card);">
+        <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:10px; border-bottom:1px solid #F1F5F9; padding-bottom:12px; margin-bottom:16px;">
+          <div>
+            <h2 style="font-size:18px; font-weight:800; color:#0F172A;">🔑 Institutional Broker & Cloud Gateway</h2>
+            <p style="font-size:12px; color:#64748B; margin-top:2px;">Connect Shoonya Finvasia & Dhan HQ Open API directly to Supabase cloud vault for persistent 24/7 trading.</p>
+          </div>
+          <div style="display:flex; gap:8px;">
+            <span style="background:#ECFDF5; color:#10B981; border:1px solid #A7F3D0; padding:4px 10px; border-radius:16px; font-weight:700; font-size:11px;">
+              🛡️ Protected Cloud Vault
+            </span>
+          </div>
+        </div>
+
+        <div style="display:grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap:20px;">
+          
+          <!-- SHOONYA GATEWAY CARD -->
+          <div style="background:#F8FAFC; border:1px solid #E2E8F0; border-radius:10px; padding:16px; display:flex; flex-direction:column; justify-content:space-between; gap:14px;">
+            <div>
+              <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:10px;">
+                <div style="display:flex; align-items:center; gap:8px;">
+                  <span style="background:#0F172A; color:#FFF; font-weight:800; font-size:12px; padding:4px 8px; border-radius:6px;">FINVASIA</span>
+                  <b style="font-size:14px; color:#0F172A;">Shoonya Gateway</b>
+                </div>
+                <span id="gatewayShoonyaBadge" style="background:#ECFDF5; color:#10B981; border:1px solid #A7F3D0; font-size:10px; font-weight:800; padding:3px 8px; border-radius:12px;">
+                  ● Live Connected
+                </span>
+              </div>
+
+              <div style="font-size:11px; color:#475569; margin-bottom:12px; line-height:1.4;">
+                <div><b>Account Vault:</b> <span style="font-family:var(--font-mono); color:#2563EB;">Enterprise Account (Encrypted)</span></div>
+                <div><b>Session Security:</b> <span style="font-family:var(--font-mono); color:#2563EB;">Daily Dynamic Token / OAuth2</span></div>
+                <div><b>Relay Network:</b> <span style="font-family:var(--font-mono); color:#10B981;">Dedicated Whitelisted Proxy (Secure NAT)</span></div>
+              </div>
+
+              <div style="display:flex; flex-direction:column; gap:8px;">
+                <label style="font-size:11px; font-weight:700; color:#334155;">Shoonya Access Token / Auth Code:</label>
+                <input type="password" id="gatewayInputShoonyaToken" placeholder="Paste 64-char access token or OAuth auth code..." style="width:100%; padding:8px 12px; border-radius:6px; border:1px solid #CBD5E1; font-family:var(--font-mono); font-size:11px;" />
+              </div>
+            </div>
+
+            <div style="display:flex; flex-direction:column; gap:8px;">
+              <button id="btnGatewaySyncShoonya" style="background:#10B981; color:#FFF; border:none; padding:10px; border-radius:6px; font-weight:800; font-size:12px; cursor:pointer;">
+                ⚡ Sync & Verify Shoonya Session
+              </button>
+              <a href="https://api.shoonya.com/OAuthlogin/authorize/oauth" target="_blank" style="text-align:center; font-size:11px; color:#2563EB; font-weight:700; text-decoration:none; padding:4px;">
+                🔗 Open Official Shoonya OAuth Login Page ↗
+              </a>
+              <div id="gatewayShoonyaMsg" style="font-size:11px; text-align:center;"></div>
+            </div>
+          </div>
+
+          <!-- DHAN HQ GATEWAY CARD -->
+          <div style="background:#F8FAFC; border:1px solid #E2E8F0; border-radius:10px; padding:16px; display:flex; flex-direction:column; justify-content:space-between; gap:14px;">
+            <div>
+              <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:10px;">
+                <div style="display:flex; align-items:center; gap:8px;">
+                  <span style="background:#2563EB; color:#FFF; font-weight:800; font-size:12px; padding:4px 8px; border-radius:6px;">DHAN HQ</span>
+                  <b style="font-size:14px; color:#0F172A;">Dhan Free Open API</b>
+                </div>
+                <span id="gatewayDhanBadge" style="background:#EFF6FF; color:#2563EB; border:1px solid #BFDBFE; font-size:10px; font-weight:800; padding:3px 8px; border-radius:12px;">
+                  ● Ready
+                </span>
+              </div>
+
+              <div style="display:flex; flex-direction:column; gap:10px;">
+                <div>
+                  <label style="font-size:11px; font-weight:700; color:#334155;">Dhan Client ID:</label>
+                  <input type="text" id="gatewayInputDhanClientId" placeholder="Enter your Dhan Client ID (e.g. 1000******)" style="width:100%; padding:8px 12px; border-radius:6px; border:1px solid #CBD5E1; font-family:var(--font-mono); font-size:11px; margin-top:4px;" />
+                </div>
+                <div>
+                  <label style="font-size:11px; font-weight:700; color:#334155;">Dhan Free API Access Token (v2):</label>
+                  <input type="password" id="gatewayInputDhanToken" placeholder="Paste Dhan API JWT Token..." style="width:100%; padding:8px 12px; border-radius:6px; border:1px solid #CBD5E1; font-family:var(--font-mono); font-size:11px; margin-top:4px;" />
+                </div>
+              </div>
+            </div>
+
+            <div style="display:flex; flex-direction:column; gap:8px; margin-top:10px;">
+              <button id="btnGatewaySyncDhan" style="background:#2563EB; color:#FFF; border:none; padding:10px; border-radius:6px; font-weight:800; font-size:12px; cursor:pointer;">
+                ⚡ Link & Save Dhan Live Account
+              </button>
+              <a href="https://dhan.co" target="_blank" style="text-align:center; font-size:11px; color:#64748B; font-weight:600; text-decoration:none; padding:4px;">
+                🔑 Get Free API Token from Dhan Web Portal ↗
+              </a>
+              <div id="gatewayDhanMsg" style="font-size:11px; text-align:center;"></div>
+            </div>
+          </div>
+
+        </div>
+
+        <!-- SUPABASE CLOUD VAULT STATUS -->
+        <div style="background:#0F172A; border-radius:8px; padding:14px; margin-top:20px; color:#F8FAFC; display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:10px;">
+          <div style="display:flex; align-items:center; gap:10px;">
+            <span style="font-size:18px;">☁️</span>
+            <div>
+              <div style="font-size:12px; font-weight:800;">Enterprise Cloud Database Synchronization</div>
+              <div style="font-size:10px; color:#94A3B8;">Vault: <code style="color:#60A5FA;">Protected Server-Side Key Vault (AES-256)</code> • Stream: <code style="color:#34D399;">8 Target Strategy Tables</code></div>
+            </div>
+          </div>
+          <span style="background:rgba(16,185,129,0.2); color:#34D399; border:1px solid rgba(16,185,129,0.4); padding:4px 10px; border-radius:12px; font-size:10px; font-weight:800;">
+            ● 8 Target Tables Synced & Streaming
+          </span>
+        </div>
+
+      </div>
+
+    </div>
+  </main>
+
+  <!-- ================================================================= -->
+  <!-- TAB 1: OVERVIEW (Native Candlestick Chart Left, Active Trades Right)-->
+  <!-- ================================================================= -->
+  <main class="tab-view-container active" id="tabOverview">
+    <div class="overview-grid">
+      
+      <!-- LEFT 60%: High-Performance Native Candlestick Chart & Order Ticket -->
+      <div style="display:flex; flex-direction:column; gap:14px;">
+        
+        <!-- Live Chart Box -->
+        <div class="card-box">
+          <div class="card-header">
+            <div>
+              <div class="card-title">
+                <span id="chartActiveSymbolTitle">CRUDEOIL (MCX)</span>
+                <span style="font-size:10px; font-weight:700; color:#10B981; background:#ECFDF5; padding:2px 6px; border-radius:10px;">Shoonya Live Feed</span>
+              </div>
+              <div style="font-size:16px; font-weight:800; font-family:var(--font-mono); margin-top:2px;" id="chartLiveCmpDisplay">
+                ₹6,432.00
+              </div>
+            </div>
+
+            <div class="tf-group">
+              <button class="tf-btn" data-tf="1m">1m</button>
+              <button class="tf-btn" data-tf="5m">5m</button>
+              <button class="tf-btn active" data-tf="15m">15m</button>
+              <button class="tf-btn" data-tf="1h">1h</button>
+              <button class="tf-btn" data-tf="1D">1D</button>
+            </div>
+          </div>
+
+          <!-- Native High-Performance HTML5 Canvas Chart Engine -->
+          <div class="canvas-chart-wrapper" id="mainChartWrapper">
+            <canvas id="mainChartCanvas"></canvas>
+          </div>
+          <div style="display:flex; justify-content:space-between; align-items:center; margin-top:6px; font-size:10px; color:var(--text-muted);">
+            <span>Indicators: <b>EMA 20</b> (Blue) • <b>EMA 50</b> (Orange) • <b>Volume</b> (Histogram)</span>
+            <span id="chartCandleInfo">Hover/drag on chart to inspect candles</span>
+          </div>
+        </div>
+
+        <!-- 1-Click Fast Order Execution Ticket -->
+        <div class="card-box">
+          <div class="card-header">
+            <div class="card-title">⚡ 1-Click Fast Order Execution</div>
+            <span style="font-size:10px; color:var(--text-muted);">Exchange: Shoonya / Paper Mode</span>
+          </div>
+
+          <div style="display:grid; grid-template-columns: 1.2fr 1fr 1fr 1fr auto; gap:8px; align-items:flex-end;">
+            <div>
+              <label style="font-size:10px; font-weight:700; color:var(--text-muted);">INSTRUMENT</label>
+              <select id="ticketSelectSymbol" style="width:100%; padding:6px; border:1px solid var(--border-card); border-radius:4px; font-size:11px; font-weight:700;">
+                <optgroup label="MCX Commodities">
+                  <option value="CRUDEOIL">CRUDEOIL (MCX)</option>
+                  <option value="NATURALGAS">NATURALGAS (MCX)</option>
+                  <option value="GOLD">GOLD MINI (MCX)</option>
+                  <option value="SILVER">SILVER MIC (MCX)</option>
+                </optgroup>
+                <optgroup label="Index Options & Indices">
+                  <option value="NIFTY 50">NIFTY 50 (NSE)</option>
+                  <option value="BANKNIFTY">BANKNIFTY (NSE)</option>
+                  <option value="FINNIFTY">FINNIFTY (NSE)</option>
+                  <option value="SENSEX">SENSEX (BSE)</option>
+                </optgroup>
+                <optgroup label="NSE Equities">
+                  <option value="RELIANCE">RELIANCE</option>
+                  <option value="TCS">TCS</option>
+                  <option value="HDFCBANK">HDFCBANK</option>
+                  <option value="INFY">INFY</option>
+                </optgroup>
+              </select>
+            </div>
+
+            <div>
+              <label style="font-size:10px; font-weight:700; color:var(--text-muted);">QTY (LOTS)</label>
+              <input type="number" id="ticketInputQty" value="1" min="1" style="width:100%; padding:6px; border:1px solid var(--border-card); border-radius:4px; font-size:11px; font-weight:700;">
+            </div>
+
+            <div>
+              <label style="font-size:10px; font-weight:700; color:var(--text-muted);">TARGET (₹)</label>
+              <input type="number" id="ticketInputTarget" placeholder="Auto 1:3" style="width:100%; padding:6px; border:1px solid var(--border-card); border-radius:4px; font-size:11px;">
+            </div>
+
+            <div>
+              <label style="font-size:10px; font-weight:700; color:var(--text-muted);">TRAILING SL (₹)</label>
+              <input type="number" id="ticketInputSL" placeholder="Auto ATR" style="width:100%; padding:6px; border:1px solid var(--border-card); border-radius:4px; font-size:11px;">
+            </div>
+
+            <div style="display:flex; gap:4px;">
+              <button id="btnExecuteBuy" style="background:#10B981; color:#FFF; border:none; padding:7px 14px; border-radius:4px; font-weight:800; font-size:11px; cursor:pointer;">
+                BUY LONG
+              </button>
+              <button id="btnExecuteSell" style="background:#EF4444; color:#FFF; border:none; padding:7px 14px; border-radius:4px; font-weight:800; font-size:11px; cursor:pointer;">
+                SELL SHORT
+              </button>
+            </div>
+          </div>
+        </div>
+
+      </div>
+
+      <!-- RIGHT 40%: Active Live Bot Trades & Strategy HUD -->
+      <div style="display:flex; flex-direction:column; gap:14px;">
+        
+        <!-- Active Trades Monitor Card -->
+        <div class="card-box">
+          <div class="card-header">
+            <div class="card-title">
+              <span>⚡ Active Live Trades</span>
+              <span id="activeTradesCountBadge" style="background:#EFF6FF; color:#2563EB; font-size:10px; padding:2px 8px; border-radius:10px; font-weight:700;">0 Open</span>
+            </div>
+            <span style="font-size:10px; color:#10B981; font-weight:700;">3-Stage Trailing SL</span>
+          </div>
+
+          <div style="overflow-x:auto;">
+            <table class="terminal-table">
+              <thead>
+                <tr>
+                  <th>Symbol</th>
+                  <th>Side</th>
+                  <th>Qty</th>
+                  <th>Entry</th>
+                  <th>CMP</th>
+                  <th>PnL (₹)</th>
+                  <th>Action</th>
+                </tr>
+              </thead>
+              <tbody id="activeTradesTableBody">
+                <tr><td colspan="7" style="text-align:center; color:var(--text-dim); padding:20px;">⚡ Bot Idle • Scanning Breakouts...</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+
+        <!-- Strategy Confluence HUD -->
+        <div class="card-box">
+          <div class="card-header">
+            <div class="card-title">🤖 AI Strategy Confluence Engine</div>
+            <span style="font-size:10px; color:#2563EB; font-weight:700;">09:00 AM - 11:30 PM</span>
+          </div>
+
+          <div style="display:grid; grid-template-columns: 1fr 1fr; gap:8px; font-size:11px;">
+            <div style="background:#F8FAFC; border:1px solid var(--border-subtle); padding:8px 10px; border-radius:6px;">
+              <div style="color:var(--text-muted); font-size:9px; font-weight:700;">VOLATILITY ATR</div>
+              <div style="font-weight:800; color:#0F172A; font-family:var(--font-mono); margin-top:2px;">1.5x Dynamic Band</div>
+            </div>
+            <div style="background:#F8FAFC; border:1px solid var(--border-subtle); padding:8px 10px; border-radius:6px;">
+              <div style="color:var(--text-muted); font-size:9px; font-weight:700;">PROFIT LOCK-IN</div>
+              <div style="font-weight:800; color:#10B981; font-family:var(--font-mono); margin-top:2px;">+15% = Zero Risk (BE)</div>
+            </div>
+            <div style="background:#F8FAFC; border:1px solid var(--border-subtle); padding:8px 10px; border-radius:6px;">
+              <div style="color:var(--text-muted); font-size:9px; font-weight:700;">RISK CAP</div>
+              <div style="font-weight:800; color:#0F172A; font-family:var(--font-mono); margin-top:2px;">Max 8% (₹40,000)</div>
+            </div>
+            <div style="background:#F8FAFC; border:1px solid var(--border-subtle); padding:8px 10px; border-radius:6px;">
+              <div style="color:var(--text-muted); font-size:9px; font-weight:700;">SIGNAL CONFIRMATION</div>
+              <div style="font-weight:800; color:#2563EB; font-family:var(--font-mono); margin-top:2px;">5-Table Confluence</div>
+            </div>
+          </div>
+        </div>
+
+      </div>
+
+    </div>
+  </main>
+
+  <!-- ================================================================= -->
+  <!-- TAB 2: DHAN TRADING TERMINAL & AI RECOMMENDATION HUB              -->
+  <!-- ================================================================= -->
+  <main class="tab-view-container" id="tabDhan">
+    <div style="display:flex; flex-direction:column; gap:16px;">
+      
+      <!-- Dhan Executive Header & Live Connection Status -->
+      <div class="card-box" style="background:linear-gradient(135deg, #0F172A 0%, #1E293B 100%); color:#FFFFFF; border:none;">
+        <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:12px;">
+          <div>
+            <div style="display:flex; align-items:center; gap:8px;">
+              <span style="background:#2563EB; color:#FFF; font-size:11px; font-weight:800; padding:3px 8px; border-radius:4px;">DHAN HQ</span>
+              <h2 style="font-size:16px; font-weight:800; margin:0;">Real-Time Broker Terminal & Portfolio Manager</h2>
+            </div>
+            <p style="font-size:11px; color:#94A3B8; margin-top:3px;">Dhan Open API v2 Direct Execution Engine • Live Holdings & Instant Orders</p>
+          </div>
+
+          <div style="display:flex; align-items:center; gap:10px;">
+            <div id="dhanLiveConnectionBadge" style="display:flex; align-items:center; gap:6px; background:rgba(37, 99, 235, 0.15); border:1px solid rgba(37, 99, 235, 0.3); padding:5px 12px; border-radius:16px; font-size:11px; font-weight:700; color:#60A5FA;">
+              <span id="dhanLiveDot" style="width:7px; height:7px; border-radius:50%; background:#3B82F6;"></span>
+              <span id="dhanLiveStatusText">Dhan: Live Connected</span>
+            </div>
+            <button onclick="switchTab('tabLoginGateway')" style="background:rgba(255, 255, 255, 0.1); border:1px solid rgba(255, 255, 255, 0.2); color:#FFF; padding:5px 12px; border-radius:6px; font-size:11px; font-weight:700; cursor:pointer;">
+              ⚙️ Manage Keys
+            </button>
+          </div>
+        </div>
+      </div>
+
+      <!-- Dhan Real-Time Financial Metric HUD -->
+      <div style="display:grid; grid-template-columns: repeat(5, 1fr); gap:12px;">
+        <div class="card-box" style="padding:12px 14px;">
+          <div style="font-size:10px; font-weight:700; color:var(--text-muted); text-transform:uppercase;">Portfolio Net Worth</div>
+          <div id="dhanKpiNetWorth" style="font-size:18px; font-weight:800; font-family:var(--font-mono); color:#0F172A; margin-top:2px;">₹0.00</div>
+          <div style="font-size:10px; color:var(--text-dim);">Live CMP Evaluation</div>
+        </div>
+
+        <div class="card-box" style="padding:12px 14px;">
+          <div style="font-size:10px; font-weight:700; color:var(--text-muted); text-transform:uppercase;">Invested Capital</div>
+          <div id="dhanKpiInvested" style="font-size:18px; font-weight:800; font-family:var(--font-mono); color:#64748B; margin-top:2px;">₹0.00</div>
+          <div style="font-size:10px; color:var(--text-dim);">Actual Cost Basis</div>
+        </div>
+
+        <div class="card-box" style="padding:12px 14px;">
+          <div style="font-size:10px; font-weight:700; color:var(--text-muted); text-transform:uppercase;">Overall Return (PnL)</div>
+          <div id="dhanKpiTotalPnl" style="font-size:18px; font-weight:800; font-family:var(--font-mono); color:#10B981; margin-top:2px;">₹0.00</div>
+          <div id="dhanKpiTotalPnlPct" style="font-size:10px; font-weight:700; color:#10B981;">+0.00% Overall</div>
+        </div>
+
+        <div class="card-box" style="padding:12px 14px;">
+          <div style="font-size:10px; font-weight:700; color:var(--text-muted); text-transform:uppercase;">Today's Day PnL</div>
+          <div id="dhanKpiDayPnl" style="font-size:18px; font-weight:800; font-family:var(--font-mono); color:#2563EB; margin-top:2px;">₹0.00</div>
+          <div style="font-size:10px; color:var(--text-dim);">Daily Fluctuation</div>
+        </div>
+
+        <div class="card-box" style="padding:12px 14px;">
+          <div style="font-size:10px; font-weight:700; color:var(--text-muted); text-transform:uppercase;">Available Margin</div>
+          <div id="dhanKpiAvailMargin" style="font-size:18px; font-weight:800; font-family:var(--font-mono); color:#F59E0B; margin-top:2px;">₹0.00</div>
+          <div style="font-size:10px; color:var(--text-dim);">Cash for Trading</div>
+        </div>
+      </div>
+
+      <!-- Live 1-Click Fast Dhan Buy / Sell Order Ticket -->
+      <div class="card-box" style="border-left:4px solid #2563EB;">
+        <div class="card-header">
+          <div class="card-title">
+            <span>⚡ Dhan 1-Click Fast Order Execution (Live / Simulated)</span>
+          </div>
+          <span style="font-size:10px; font-weight:700; color:#2563EB; background:#EFF6FF; padding:2px 8px; border-radius:10px;">Direct Dhan v2 Gateway</span>
+        </div>
+
+        <div style="display:grid; grid-template-columns: 1.5fr 1fr 1fr 1fr 1fr auto; gap:10px; align-items:flex-end;">
+          <div>
+            <label style="font-size:10px; font-weight:700; color:var(--text-muted);">SCRIP / SYMBOL</label>
+            <input type="text" id="dhanOrderSymbol" value="BSE" placeholder="e.g. BSE, CDSL, RELIANCE..." style="width:100%; padding:7px; border:1px solid var(--border-card); border-radius:4px; font-size:11px; font-weight:800; font-family:var(--font-mono); text-transform:uppercase;">
+          </div>
+
+          <div>
+            <label style="font-size:10px; font-weight:700; color:var(--text-muted);">EXCHANGE</label>
+            <select id="dhanOrderExchange" style="width:100%; padding:7px; border:1px solid var(--border-card); border-radius:4px; font-size:11px; font-weight:700;">
+              <option value="NSE">NSE (National)</option>
+              <option value="BSE">BSE (Bombay)</option>
+            </select>
+          </div>
+
+          <div>
+            <label style="font-size:10px; font-weight:700; color:var(--text-muted);">QUANTITY</label>
+            <input type="number" id="dhanOrderQty" value="10" min="1" style="width:100%; padding:7px; border:1px solid var(--border-card); border-radius:4px; font-size:11px; font-weight:700;">
+          </div>
+
+          <div>
+            <label style="font-size:10px; font-weight:700; color:var(--text-muted);">PRODUCT</label>
+            <select id="dhanOrderProduct" style="width:100%; padding:7px; border:1px solid var(--border-card); border-radius:4px; font-size:11px; font-weight:700;">
+              <option value="CNC">CNC (Delivery / Holding)</option>
+              <option value="INTRADAY">MIS (Intraday)</option>
+            </select>
+          </div>
+
+          <div>
+            <label style="font-size:10px; font-weight:700; color:var(--text-muted);">ORDER TYPE</label>
+            <select id="dhanOrderType" style="width:100%; padding:7px; border:1px solid var(--border-card); border-radius:4px; font-size:11px; font-weight:700;">
+              <option value="MARKET">MARKET (Instant)</option>
+              <option value="LIMIT">LIMIT (Price)</option>
+            </select>
+          </div>
+
+          <div style="display:flex; gap:6px;">
+            <button id="btnDhanBuyOrder" style="background:#10B981; color:#FFF; border:none; padding:8px 16px; border-radius:4px; font-weight:800; font-size:11px; cursor:pointer;">
+              🟢 BUY ON DHAN
+            </button>
+            <button id="btnDhanSellOrder" style="background:#EF4444; color:#FFF; border:none; padding:8px 16px; border-radius:4px; font-weight:800; font-size:11px; cursor:pointer;">
+              🔴 SELL / EXIT
+            </button>
+          </div>
+        </div>
+      </div>
+
+      <!-- Real Holdings Table -->
+      <div class="card-box">
+        <div class="card-header">
+          <div class="card-title">📈 Real Dhan Holdings & Portfolio Scrips</div>
+          <span id="dhanPortfolioNetWorthBadge" style="font-size:12px; font-weight:800; color:#10B981; font-family:var(--font-mono);"></span>
+        </div>
+
+        <table class="terminal-table">
+          <thead>
+            <tr>
+              <th>Trading Symbol</th>
+              <th>Company Name</th>
+              <th>Qty</th>
+              <th>Avg Cost (₹)</th>
+              <th>Live CMP (₹)</th>
+              <th>Unrealized PnL (₹)</th>
+              <th>PnL %</th>
+              <th>Quick Actions</th>
+            </tr>
+          </thead>
+          <tbody id="dhanHoldingsTableBody">
+            <tr><td colspan="8" style="text-align:center; color:var(--text-dim); padding:24px;">Dhan account not connected. Enter Client ID & Token above to stream real holdings.</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <!-- ================================================================= -->
+      <!-- AI STOCK RECOMMENDATION & FUTURE OUTLOOK ENGINE                   -->
+      <!-- ================================================================= -->
+      <div class="card-box" style="border-top:3px solid #10B981;">
+        <div class="card-header">
+          <div class="card-title">
+            <span>🤖 AI Stock Recommendation & Future Outlook Engine</span>
+          </div>
+          <span style="font-size:11px; font-weight:700; color:#10B981; background:#ECFDF5; padding:2px 8px; border-radius:10px;">
+            Gemini AI Multi-Horizon Analyst
+          </span>
+        </div>
+
+        <!-- Interactive Stock Analyzer Query Bar -->
+        <div style="background:#F8FAFC; border:1px solid var(--border-subtle); padding:12px; border-radius:8px; display:flex; gap:10px; align-items:center; flex-wrap:wrap; margin-bottom:14px;">
+          <span style="font-size:11px; font-weight:700; color:var(--text-muted);">🔍 Analyze Any Scrip (e.g. BSE, CDSL, RELIANCE, TATAMOTORS, IRFC):</span>
+          <input type="text" id="inputCustomAiScrip" value="BSE" placeholder="Type scrip symbol..." style="padding:6px 12px; border:1px solid var(--border-card); border-radius:4px; font-size:11px; font-weight:800; font-family:var(--font-mono); text-transform:uppercase; min-width:140px;">
+          <button id="btnRunCustomAiAnalysis" style="background:#10B981; color:#FFF; border:none; padding:6px 14px; border-radius:4px; font-size:11px; font-weight:800; cursor:pointer;">
+            ⚡ Get AI Forecast
+          </button>
+        </div>
+
+        <!-- Dynamic AI Analysis Result Card -->
+        <div id="aiScripAnalysisResultCard" style="background:#FFFFFF; border:1px solid var(--border-card); border-radius:8px; padding:16px; margin-bottom:16px; display:none;">
+          <!-- Dynamically populated via app.js -->
+        </div>
+
+        <!-- Top Curated AI Stock Recommendations List -->
+        <div style="font-size:12px; font-weight:800; color:#0F172A; margin-bottom:8px; display:flex; align-items:center; justify-content:space-between;">
+          <span>📌 High-Conviction Institutional AI Picks (BSE, CDSL, Tata Motors, etc.)</span>
+          <span style="font-size:10px; color:var(--text-muted);">Updated with Live Market Catalysts</span>
+        </div>
+
+        <div id="dhanAiRecommendationsList" style="display:grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap:12px;">
+          <!-- Dynamically rendered via app.js -->
+        </div>
+
+      </div>
+
+    </div>
+  </main>
+
+  <!-- ================================================================= -->
+  <!-- TAB 3: MCX LIVE GRID (4-Quadrant Native Candlestick Monitors)      -->
+  <!-- ================================================================= -->
+  <main class="tab-view-container" id="tabMcx">
+    <div style="display:grid; grid-template-columns: 1fr 1fr; gap:16px;">
+      
+      <div class="card-box">
+        <div class="card-header">
+          <b style="color:#0F172A;">CRUDEOIL (MCX) Live 15m</b>
+          <span class="val-green" id="mcxGridPriceCrude">₹6,432.00</span>
+        </div>
+        <div class="canvas-chart-wrapper" style="height:250px;">
+          <canvas id="mcxCanvasCrude"></canvas>
+        </div>
+      </div>
+
+      <div class="card-box">
+        <div class="card-header">
+          <b style="color:#0F172A;">GOLD MINI (MCX) Live 15m</b>
+          <span class="val-green" id="mcxGridPriceGold">₹71,280.00</span>
+        </div>
+        <div class="canvas-chart-wrapper" style="height:250px;">
+          <canvas id="mcxCanvasGold"></canvas>
+        </div>
+      </div>
+
+      <div class="card-box">
+        <div class="card-header">
+          <b style="color:#0F172A;">SILVER MIC (MCX) Live 15m</b>
+          <span class="val-green" id="mcxGridPriceSilver">₹82,450.00</span>
+        </div>
+        <div class="canvas-chart-wrapper" style="height:250px;">
+          <canvas id="mcxCanvasSilver"></canvas>
+        </div>
+      </div>
+
+      <div class="card-box">
+        <div class="card-header">
+          <b style="color:#0F172A;">NATURALGAS (MCX) Live 15m</b>
+          <span class="val-green" id="mcxGridPriceNatgas">₹194.50</span>
+        </div>
+        <div class="canvas-chart-wrapper" style="height:250px;">
+          <canvas id="mcxCanvasNatgas"></canvas>
+        </div>
+      </div>
+
+    </div>
+  </main>
+
+  <!-- ================================================================= -->
+  <!-- TAB 4: ORACLE BREAKOUT SIGNALS (5-Table Watchlist Stream)          -->
+  <!-- ================================================================= -->
+  <main class="tab-view-container" id="tabOracle">
+    <div class="card-box">
+      <div class="card-header">
+        <div class="card-title">🎯 Oracle 5-Table Real-Time Breakout Signals & Watchlist</div>
+        <span style="font-size:11px; color:#2563EB; font-weight:700;">Supabase Realtime Stream</span>
+      </div>
+
+      <!-- Sub-filter buttons -->
+      <div class="sub-tabs">
+        <button class="sub-tab-btn active" data-filter="ALL">All Signals</button>
+        <button class="sub-tab-btn" data-filter="INDEX">📊 Index Options (Nifty / BankNifty / Sensex / FinNifty)</button>
+        <button class="sub-tab-btn" data-filter="MCX">⚡ MCX Commodities (Crude / Gold / Silver / NatGas)</button>
+        <button class="sub-tab-btn" data-filter="INTRADAY">📈 Intraday Stocks</button>
+        <button class="sub-tab-btn" data-filter="BTST">🌙 BTST & Weekly Momentum</button>
+      </div>
+
+      <table class="terminal-table">
+        <thead>
+          <tr>
+            <th>Source Table</th>
+            <th>Symbol</th>
+            <th>Signal</th>
+            <th>Spot Price (₹)</th>
+            <th>Target (₹)</th>
+            <th>Stop Loss (₹)</th>
+            <th>Strategy</th>
+            <th>Action</th>
+          </tr>
+        </thead>
+        <tbody id="oracleSignalsTableBody">
+          <!-- Dynamic signals from app.js -->
+        </tbody>
+      </table>
+    </div>
+  </main>
+
+  <!-- ================================================================= -->
+  <!-- TAB 5: TRADE LEDGER (Audit Log & Realized PnL History)             -->
+  <!-- ================================================================= -->
+  <main class="tab-view-container" id="tabLedger">
+    <div class="card-box">
+      <div class="card-header">
+        <div class="card-title">📜 Realized Trades Audit Ledger</div>
+        <span style="font-size:11px; color:var(--text-muted);">Real Execution History</span>
+      </div>
+
+      <table class="terminal-table">
+        <thead>
+          <tr>
+            <th>Trade ID</th>
+            <th>Instrument</th>
+            <th>Qty</th>
+            <th>Entry (₹)</th>
+            <th>Exit (₹)</th>
+            <th>Gross PnL (₹)</th>
+            <th>Brokerage (₹)</th>
+            <th>Net PnL (₹)</th>
+            <th>Exit Reason</th>
+            <th>Timestamp</th>
+          </tr>
+        </thead>
+        <tbody id="tradeLedgerTableBody">
+          <tr><td colspan="10" style="text-align:center; color:var(--text-dim); padding:24px;">No realized trades logged yet. Real trades will appear here upon square-off.</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </main>
+
+  <!-- Statutory Regulatory & Risk Compliance Disclaimer -->
+  <footer style="margin: 24px 16px 20px; padding: 14px 18px; background: #0F172A; border-radius: 8px; color: #94A3B8; font-size: 10px; line-height: 1.5; border: 1px solid #1E293B;">
+    <div style="display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid #1E293B; padding-bottom: 6px; margin-bottom: 6px; flex-wrap: wrap; gap: 6px;">
+      <b style="color: #F8FAFC; font-size: 11px;">⚠️ Regulatory & Risk Compliance Notice (SEBI & Research Sandbox Disclaimer)</b>
+      <span style="color: #64748B;">For Algorithmic Research & Private Testing Sandbox Only</span>
+    </div>
+    <p style="margin: 0 0 4px;">
+      <b>Not Financial Advice:</b> The algorithmic signals, technical indicators, and computational analytics displayed on this dashboard are for software testing, educational research, and sandbox analysis only. This platform does not provide investment advice or research recommendations under SEBI (Research Analysts) Regulations, 2014.
+    </p>
+    <p style="margin: 0 0 4px;">
+      <b>Market Risk Disclosure:</b> Trading in equities, derivatives (F&amp;O), and commodities involves substantial risk of loss. As per SEBI studies, over 90% of individual derivative traders incur net losses. Users are strictly responsible for their own trading decisions and broker API orders.
+    </p>
+    <p style="margin: 0; color: #64748B;">
+      © 2026 Stock Pro India Terminal. All broker trademarks (DhanHQ, Shoonya/Finvasia, Yahoo Finance, NSE, BSE, MCX) are the properties of their respective owners and referenced purely for technical interoperability.
+    </p>
+  </footer>
+
+  <!-- Main Controller Script -->
+  <script src="/static/app.js?t=1723940002"></script>
+</body>
+</html>

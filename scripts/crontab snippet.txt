@@ -1,0 +1,22 @@
+# --- breakouts_scanner.py auto-start (add via `crontab -e`) ---
+# Self-healing pattern: the script's own fcntl lock (acquire_singleton_lock)
+# means it's always safe to "try to start" it -- if an instance is already
+# running, the new attempt just logs "Another instance is already running"
+# and exits immediately. So a plain repeating cron entry, with no extra
+# watchdog script, both (a) starts it fresh each morning and (b) auto-restarts
+# it within 5 minutes if it ever crashes -- no systemd needed.
+#
+# Adjust the two paths below to match your actual venv + install location.
+
+# Try every 5 min, 8 AM-4 PM IST, Mon-Fri (covers pre-market + BTST morning
+# exit window + full session + a safety margin past the 3:30 close).
+*/5 8-16 * * 1-5 cd /home/ubuntu/Stock-Pro-India && /home/ubuntu/Stock-Pro-India/venv/bin/python3 breakouts_scanner.py >> /home/ubuntu/Stock-Pro-India/logs/breakouts_scanner.log 2>&1
+
+# Also fire once on server reboot, in case it goes down overnight.
+@reboot cd /home/ubuntu/Stock-Pro-India && /home/ubuntu/Stock-Pro-India/venv/bin/python3 breakouts_scanner.py >> /home/ubuntu/Stock-Pro-India/logs/breakouts_scanner.log 2>&1
+
+# One-time setup:
+#   mkdir -p /home/ubuntu/Stock-Pro-India/logs
+#   crontab -e   (paste the two lines above, with your real paths)
+#   crontab -l   (verify)
+# Tail the log live with: tail -f /home/ubuntu/Stock-Pro-India/logs/breakouts_scanner.log

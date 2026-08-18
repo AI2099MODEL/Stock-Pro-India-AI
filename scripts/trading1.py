@@ -1,0 +1,1403 @@
+"""
+Trading engine for the paper trading bot: Supabase/capital/charges plumbing,
+signal scanning, live trade management, and reporting - all in one module.
+
+Merges FOUR files that were previously separate but always used together in
+the same pipeline (plumbing -> scan -> manage -> report):
+
+  0. Core plumbing - was core.py (Supabase REST client, capital allocation
+     / position sizing, brokerage + statutory charges estimate). Folded in
+     here because trading.py was its only caller and the two always shipped
+     together; splitting them added an import with no real boundary.
+
+  1. Signal scanning   - was scanner.py
+     Scans the 5 signal source tables every SIGNAL_SCAN_INTERVAL_SECONDS,
+     detects new entries, sizes the position against the 5L budget, and
+     logs them into "Paper Trading". Skips duplicates via
+     (source_table, source_id) lookup. BTST entries are only accepted
+     before the 3 PM cutoff.
+
+  2. Live trade management - was trade_manager.py
+     For every OPEN row in "Paper Trading":
+       a. Fetch live price from Shoonya
+       b. Update cmp / highest_price / lowest_price / time_elapsed_minutes
+       c. Apply trailing SL logic
+       d. Check partial profit booking (books half the qty once halfway to target)
+       e. Check BTST morning exit (9:15-9:30 AM, book if in profit)
+       f. Check target / stop_loss / trailing_stop_loss hits -> close trade
+       g. Square off INTRADAY trades still open after session end
+       h. On any close (full or partial), compute brokerage-adjusted net PNL
+          and write a row to "Profit Log"
+
+  3. Reporting - was reports.py
+     Generates daily / weekly / monthly reports from "Profit Log" (the
+     realized PNL ledger - includes both full exits and partial bookings)
+     and writes them to reports/ on the VPS as CSV + a text summary. Also
+     snapshots currently OPEN positions (CMP, invested amount, unrealized
+     PNL, time elapsed) so each report shows the full picture, not just
+     what's closed.
+
+Each section keeps its own logger name (core_log / scan_log / tm_log /
+reports_log) so log lines stay identifiable as before, even though they now
+live in one module.
+
+main.py's run loop calls scan_once() and update_open_trades() directly.
+Reports are intentionally NOT triggered from inside that loop (so reporting
+doesn't depend on the bot staying up) - schedule them separately via cron,
+or run this file standalone:
+    python3 trading.py report daily|weekly|monthly
+
+Before trusting the bot to trade unattended, run a read-only connectivity
+smoke test (Supabase + Shoonya wiring status):
+    python3 trading.py test-connectivity [limit]
+
+Live prices (get_ltp, used by update_open_trades) come from Shoonya. Since
+Shoonya is already connected on the VPS, get_ltp() does NOT handle
+login/auth/session setup - it only needs your existing session object
+plugged in once, at _get_shoonya_client() below. See the "WIRE THIS UP"
+comment there; nothing else in this file needs to change.
+
+is_shoonya_reachable() is a separate, simpler check: pure network
+reachability against Shoonya's API host, no login/credentials needed. Use
+it (via test-connectivity below) to confirm the VPS can reach Shoonya at
+all, independent of whether the real session has been wired up yet.
+
+CHARGES COVERAGE: compute_charges() below handles all three instrument
+types you trade - EQUITY_DELIVERY (BTST/WEEKLY stock trades), EQUITY_INTRADAY
+(stock intraday), FUTURES, and OPTIONS - each with its own brokerage/STT/DP
+rules per segment (see classify_segment). It also now takes direction
+(is_short) into account, since stamp duty (buy-side only) and STT (sell-side
+only) depend on which leg was actually the buy vs the sell - that's inverted
+on a short trade relative to a long one.
+"""
+import csv
+import datetime
+import logging
+import os
+import sys
+import time
+from urllib.parse import quote
+
+import requests
+
+import config
+
+# ===========================================================================
+# 0. Supabase REST (PostgREST) client
+#    Avoids extra dependencies beyond `requests` so it drops onto any VPS
+#    cleanly.
+# ===========================================================================
+core_log = logging.getLogger("core")
+
+REST_URL = f"{config.SUPABASE_URL}/rest/v1"
+
+HEADERS = {
+    "apikey": config.SUPABASE_ANON_KEY,
+    "Authorization": f"Bearer {config.SUPABASE_ANON_KEY}",
+    "Content-Type": "application/json",
+}
+
+
+def _table_path(table: str) -> str:
+    # table names with spaces (e.g. "Paper Trading") need URL-safe encoding
+    return f"{REST_URL}/{quote(table)}"
+
+
+def select(table: str, params: dict = None, headers_extra: dict = None):
+    """SELECT rows. params follow PostgREST query syntax, e.g.
+    {"select": "*", "status": "eq.OPEN", "order": "id.desc", "limit": "50"}
+    """
+    headers = {**HEADERS, **(headers_extra or {})}
+    resp = requests.get(_table_path(table), headers=headers, params=params or {}, timeout=15)
+    resp.raise_for_status()
+    return resp.json()
+
+
+def insert(table: str, rows):
+    """INSERT one row (dict) or many rows (list of dicts). Returns inserted rows."""
+    headers = {**HEADERS, "Prefer": "return=representation"}
+    resp = requests.post(_table_path(table), headers=headers, json=rows, timeout=15)
+    resp.raise_for_status()
+    return resp.json()
+
+
+def update(table: str, match: dict, values: dict):
+    """UPDATE rows matching `match` (e.g. {"id": "eq.5"}) with `values`."""
+    headers = {**HEADERS, "Prefer": "return=representation"}
+    resp = requests.patch(_table_path(table), headers=headers, params=match, json=values, timeout=15)
+    resp.raise_for_status()
+    return resp.json()
+
+
+# ===========================================================================
+# 0b. Capital allocation
+#    Tracks how much of the 5L budget is currently deployed (sum of
+#    invested_amount across OPEN Paper Trading rows) and decides how many
+#    shares/lots to buy for a new entry, respecting:
+#      - the 30% buffer (never deploy more than DEPLOYABLE_BUDGET_INR at once)
+#      - a per-trade cap (MAX_ALLOCATION_PER_TRADE_INR) so no single scrip
+#        dominates the book
+# ===========================================================================
+def get_deployed_capital() -> float:
+    open_trades = select(
+        config.PAPER_TRADING_TABLE,
+        params={"select": "invested_amount", "status": "eq.OPEN", "limit": "5000"},
+    )
+    return sum(float(t.get("invested_amount") or 0) for t in open_trades)
+
+
+def get_available_capital() -> float:
+    deployed = get_deployed_capital()
+    return max(0.0, config.DEPLOYABLE_BUDGET_INR - deployed)
+
+
+def decide_quantity(entry_price: float, lot_size: float = None) -> dict:
+    """
+    Returns {"quantity": int, "invested_amount": float, "skipped_reason": str|None}
+    lot_size: if the instrument trades in lots (F&O), quantity is rounded
+    down to a multiple of lot_size. Equities default to lot_size=1.
+    """
+    lot_size = int(lot_size) if lot_size else 1
+    if not entry_price or entry_price <= 0:
+        return {"quantity": 0, "invested_amount": 0.0, "skipped_reason": "invalid_entry_price"}
+
+    available = get_available_capital()
+    allocation = min(config.MAX_ALLOCATION_PER_TRADE_INR, available)
+
+    if allocation < config.MIN_TRADE_VALUE_INR:
+        return {"quantity": 0, "invested_amount": 0.0, "skipped_reason": "insufficient_capital"}
+
+    lot_value = entry_price * lot_size
+    num_lots = int(allocation // lot_value)
+
+    if num_lots < 1:
+        # allocation can't even cover one lot - skip rather than over-invest
+        return {"quantity": 0, "invested_amount": 0.0, "skipped_reason": "allocation_below_one_lot"}
+
+    quantity = num_lots * lot_size
+    invested_amount = quantity * entry_price
+
+    if invested_amount < config.MIN_TRADE_VALUE_INR:
+        return {"quantity": 0, "invested_amount": 0.0, "skipped_reason": "below_min_trade_value"}
+
+    return {"quantity": quantity, "invested_amount": invested_amount, "skipped_reason": None}
+
+
+# ===========================================================================
+# 0c. Brokerage + statutory charges
+#    Approximates Shoonya's (Finvasia) published brokerage + statutory
+#    charges, since there is no brokerage-calculation endpoint in the
+#    NorenAPI trading API - their brokerage calculator is a website tool,
+#    not something a script can "download" or call. This encodes their
+#    publicly published flat rates as closely as possible (cross-checked
+#    against shoonya.com/pricing and shoonya.com/calculators/brokerage-
+#    calculator). Treat results as a good estimate for net PNL tracking,
+#    not as gospel - spot-check periodically, especially STT: it nearly
+#    doubled on F&O effective 1 Apr 2026 (Budget 2026) and can change again.
+#
+#    Segment classification (derived from the paper trade row):
+#      EQUITY_DELIVERY -> BTST / WEEKLY trades on NSE/BSE equity (no
+#                         option_type, no expiry) - your stock BTST/weekly book
+#      EQUITY_INTRADAY -> INTRADAY trades on NSE/BSE equity (stocks)
+#      OPTIONS         -> option_type is CE/PE (index/stock options)
+#      FUTURES         -> has an expiry but no option_type (futures, incl. MCX)
+#
+#    All three instrument classes you actually trade - stocks (delivery via
+#    BTST/WEEKLY, and intraday), options, and futures - are covered here.
+# ===========================================================================
+def classify_segment(row: dict) -> str:
+    option_type = row.get("option_type")
+    expiry = row.get("expiry")
+    trade_type = (row.get("trade_type") or "").upper()
+
+    if option_type in ("CE", "PE"):
+        return "OPTIONS"
+    if expiry:
+        return "FUTURES"
+    if trade_type == "INTRADAY":
+        return "EQUITY_INTRADAY"
+    return "EQUITY_DELIVERY"  # BTST / WEEKLY equity, held overnight+
+
+
+def _order_brokerage(turnover: float, segment: str) -> float:
+    rate = config.BROKERAGE_RATES[segment]
+    if rate["mode"] == "flat":
+        return rate["flat"]
+    # "lower_of": whichever is lower between the percentage-based charge and the flat cap
+    pct_based = turnover * rate["pct"]
+    return min(pct_based, rate["flat"])
+
+
+def compute_charges(row: dict, exit_price: float, is_short: bool = False, charge_dp: bool = True) -> dict:
+    """
+    row: the Paper Trading row (dict) being closed/partially closed - needs
+         entry_price and quantity (quantity should already be set to the
+         exiting quantity for a partial booking, not the original size).
+    exit_price: live exit price
+    is_short: True if entry was actually the SELL leg and exit is the
+        BUY-to-cover leg (i.e. _is_short(row) upstream). Brokerage,
+        exchange txn charge, GST, and SEBI charge are genuinely per-order
+        (charged on both legs regardless of direction) so they're unaffected.
+        Stamp duty (buy-side only) and STT (sell-side only) are direction-
+        dependent, so those two get the entry/exit turnover swapped when
+        is_short=True - otherwise a short trade's stamp duty/STT is computed
+        on the wrong leg.
+    charge_dp: whether to include the equity-delivery DP charge on this
+        exit. Real DP charges are billed once per scrip per settlement day
+        (not once per sell execution), so callers should pass False for a
+        second exit of the same position happening on the same calendar
+        day (e.g. a partial booking followed later that day by the full
+        close) to avoid double-billing it. See _dp_charged_today().
+    Returns {"segment", "brokerage", "other_charges", "total_charges", "net_pnl"}
+    """
+    entry_price = float(row["entry_price"])
+    quantity = float(row.get("quantity") or 0)
+    gross_pnl = float(row.get("pnl") or 0)
+
+    entry_turnover = entry_price * quantity
+    exit_turnover = exit_price * quantity
+
+    # Which leg was actually the buy vs. the sell, for the two side-specific
+    # charges (stamp duty = buy-side only, STT = sell-side only).
+    buy_turnover = exit_turnover if is_short else entry_turnover
+    sell_turnover = entry_turnover if is_short else exit_turnover
+
+    segment = classify_segment(row)
+
+    # Brokerage/exchange/GST/SEBI are charged per executed order regardless
+    # of buy/sell side, so these keep using entry_turnover/exit_turnover
+    # (i.e. "the two legs"), not buy/sell.
+    brokerage = _order_brokerage(entry_turnover, segment) + _order_brokerage(exit_turnover, segment)
+    exchange_txn = (entry_turnover + exit_turnover) * config.EXCHANGE_TXN_CHARGE_PCT
+    sebi = (entry_turnover + exit_turnover) * config.SEBI_CHARGE_PCT
+
+    # Side-specific: stamp duty is buy-side only.
+    stamp_duty = buy_turnover * config.STAMP_DUTY_BUY_PCT
+
+    # Side-specific: STT is sell-side only, except equity delivery which is
+    # charged on both legs.
+    if segment == "OPTIONS":
+        stt = sell_turnover * config.STT_OPTIONS_SELL_PCT
+    elif segment == "FUTURES":
+        stt = sell_turnover * config.STT_FUTURES_SELL_PCT
+    elif segment == "EQUITY_INTRADAY":
+        stt = sell_turnover * config.STT_INTRADAY_SELL_PCT
+    else:  # EQUITY_DELIVERY
+        stt = (buy_turnover + sell_turnover) * config.STT_DELIVERY_PCT
+
+    # DP (depository participant) charge: only on equity delivery sells
+    # (BTST/WEEKLY exits) - Rs 9 + GST per scrip, once per sell execution.
+    # Never applies to intraday, options, or futures.
+    dp_charge = 0.0
+    if segment == "EQUITY_DELIVERY" and charge_dp:
+        dp_charge = config.DP_CHARGE_PER_SCRIP_INR * (1 + config.GST_PCT)
+
+    gst = (brokerage + exchange_txn) * config.GST_PCT
+
+    other_charges = exchange_txn + gst + sebi + stamp_duty + stt + dp_charge
+    total_charges = brokerage + other_charges
+    net_pnl = gross_pnl - total_charges
+
+    return {
+        "segment": segment,
+        "brokerage": round(brokerage, 2),
+        "other_charges": round(other_charges, 2),
+        "total_charges": round(total_charges, 2),
+        "net_pnl": round(net_pnl, 2),
+    }
+
+
+# ===========================================================================
+# 1. Shoonya live-price feed
+# ===========================================================================
+feed_log = logging.getLogger("shoonya_feed")
+
+# Official Shoonya (Finvasia NorenAPI) REST base - used only for a pure
+# network-reachability check below (is_shoonya_reachable). No login/API key
+# needed to hit this: any HTTP response at all (even an auth error) proves
+# the network path from this VPS to Shoonya is live. Source:
+# https://github.com/Shoonya-Dev/ShoonyaApi-py/blob/master/api_helper.py
+SHOONYA_API_HOST = "https://api.shoonya.com/NorenWClientTP/"
+
+_shoonya_client = None  # cache the session object once wired up
+
+
+def is_shoonya_reachable(timeout: float = 5.0) -> bool:
+    """
+    Network-only reachability check - requires no login, no credentials, no
+    session object. Just confirms this VPS can actually reach Shoonya's API
+    host at all, before you bother wiring up the real logged-in session in
+    _get_shoonya_client(). Any HTTP response (even a 4xx auth error) counts
+    as reachable; only a connection failure/timeout counts as not reachable.
+    """
+    try:
+        requests.get(SHOONYA_API_HOST, timeout=timeout)
+        return True
+    except requests.exceptions.RequestException as e:
+        feed_log.warning("Shoonya endpoint not reachable: %s", e)
+        return False
+
+
+def _get_shoonya_client():
+    """
+    Delegates entirely to shoonya_connection.get_client() - the connection
+    itself (cred.yaml, OAuth header injection, NorenApi construction) lives
+    in that separate file on purpose, so it can be fixed/tested in
+    isolation (`python3 shoonya_connection.py`) without touching anything
+    here. This function just caches the result for trading.py's own use.
+
+    IMPORTANT - token lifetime: cred.yaml's Access_token is a per-day OAuth
+    token, not auto-refreshed by this bot. If the process stays up across a
+    refresh (e.g. left running into the next trading day), calls will start
+    failing with an auth error until _get_shoonya_client(force_reconnect=True)
+    is called (or the process is restarted) against a freshly-refreshed
+    cred.yaml. Restart the bot each morning after that refresh has run,
+    before market open.
+    """
+    global _shoonya_client
+    if _shoonya_client is not None:
+        return _shoonya_client
+    import shoonya_connection
+    _shoonya_client = shoonya_connection.get_client()
+    return _shoonya_client
+
+
+def get_ltp(exchange: str, token: str) -> float:
+    """
+    Return the last traded price for a given exchange + token.
+    exchange: e.g. "NSE", "NFO", "BFO", "MCX"
+    token: Shoonya scrip token (as stored in the source signal tables)
+    """
+    client = _get_shoonya_client()
+    quote = client.get_quotes(exchange=exchange, token=str(token))
+    # NorenApiPy quote responses commonly use "lp" for last price
+    return float(quote["lp"])
+
+
+def search_scrip(exchange: str, searchtext: str) -> list:
+    """
+    Thin wrapper over NorenApi's searchscrip - text search across the
+    scrip master, e.g. search "RELIANCE" on NFO to get every RELIANCE
+    option/future contract (all expiries, all strikes). Returns the raw
+    list of matches (each a dict with tsym/token/exd/optt/strprc/ls/...),
+    or [] if the client reports no results.
+    """
+    client = _get_shoonya_client()
+    result = client.searchscrip(exchange=exchange, searchtext=searchtext)
+    if not result or result.get("stat") != "Ok":
+        return []
+    return result.get("values", [])
+
+
+def get_atm_option(underlying_symbol: str, spot_price: float, option_type: str) -> dict:
+    """
+    Find the nearest-expiry, nearest-strike (true ATM) option contract for
+    a given NSE stock, using Shoonya's searchscrip (not get_option_chain -
+    that call requires already knowing a valid contract tradingsymbol for
+    the underlying as a "seed", which isn't something we have for a plain
+    equity signal; searchscrip works off the underlying's name directly).
+
+    underlying_symbol: NSE symbol, e.g. "RELIANCE" (no "-EQ" suffix)
+    spot_price: current stock price, used to pick the closest strike
+    option_type: "CE" or "PE"
+
+    Returns {"tradingsymbol", "token", "strike", "expiry", "lot_size"} for
+    the best match, or None if nothing usable came back.
+
+    NOTE: searchscrip does a substring match on symbol/company name, so a
+    short symbol can occasionally pick up an unrelated scrip (e.g. "SBIN"
+    matching something containing that substring elsewhere in the name) -
+    the startswith() filter below guards against the common case, but
+    spot-check the first few real trades against what you'd expect before
+    trusting this unattended.
+    """
+    matches = search_scrip(config.OPTIONS_EXCHANGE, underlying_symbol)
+
+    candidates = [
+        m for m in matches
+        if m.get("optt") == option_type
+        and str(m.get("tsym", "")).upper().startswith(underlying_symbol.upper())
+        and m.get("strprc") is not None
+    ]
+    if not candidates:
+        return None
+
+    # Nearest expiry first. exd is typically "DD-MMM-YYYY" (e.g.
+    # "28-AUG-2025") in NorenApi responses - fall back to plain string sort
+    # if a format shows up that doesn't parse, rather than crashing.
+    def _parse_expiry(m):
+        exd = m.get("exd")
+        if not exd:
+            return datetime.date.max
+        for fmt in ("%d-%b-%Y", "%d-%m-%Y", "%Y-%m-%d"):
+            try:
+                return datetime.datetime.strptime(exd, fmt).date()
+            except ValueError:
+                continue
+        return datetime.date.max  # unparsed formats sort last, not first
+
+    nearest_expiry = min(_parse_expiry(m) for m in candidates)
+    same_expiry = [m for m in candidates if _parse_expiry(m) == nearest_expiry]
+
+    # True ATM = strike closest to current spot price.
+    def _strike(m):
+        try:
+            return float(m["strprc"])
+        except (TypeError, ValueError):
+            return float("inf")
+
+    best = min(same_expiry, key=lambda m: abs(_strike(m) - spot_price))
+
+    lot_size = best.get("ls")
+    try:
+        lot_size = int(float(lot_size))
+    except (TypeError, ValueError):
+        lot_size = config.OPTIONS_FALLBACK_LOT_SIZE
+
+    return {
+        "tradingsymbol": best.get("tsym"),
+        "token": best.get("token"),
+        "strike": _strike(best),
+        "expiry": best.get("exd"),
+        "lot_size": lot_size,
+    }
+
+
+# ===========================================================================
+# 2. Signal scanning
+# ===========================================================================
+scan_log = logging.getLogger("scanner")
+
+
+def _already_logged(source_table: str, source_id, leg: str) -> bool:
+    """
+    Dedup is per (source_table, source_id, leg) - NOT just per source row -
+    so that in STOCK_SIGNAL_MODE="BOTH", a failed option leg (e.g. transient
+    option_lookup_failed / option_ltp_failed) doesn't get silently and
+    permanently orphaned just because its sibling stock leg already
+    inserted a row for the same source_id. Each leg can retry independently
+    on the next scan until it succeeds.
+    """
+    rows = select(
+        config.PAPER_TRADING_TABLE,
+        params={
+            "select": "id",
+            "source_table": f"eq.{source_table}",
+            "source_id": f"eq.{source_id}",
+            "leg": f"eq.{leg}",
+            "limit": "1",
+        },
+    )
+    return len(rows) > 0
+
+
+def _fetch_new_rows(table: str, cfg: dict):
+    trigger_col = cfg["trigger_column"]
+    params = {"select": "*", "order": "id.desc", "limit": "200"}
+
+    if trigger_col == "signal":
+        params["signal"] = "neq.NONE"
+    elif trigger_col == "status":
+        params["status"] = "eq.OPEN"
+
+    return select(table, params=params)
+
+
+def _btst_cutoff_passed() -> bool:
+    return datetime.datetime.now().time() > config.BTST_ENTRY_CUTOFF
+
+
+def _btst_entry_window_open() -> bool:
+    """
+    BTST entries are only taken in a strict window (default 2:45 PM -
+    3:20 PM IST) at end of day, not any time before the cutoff. Add
+    BTST_ENTRY_WINDOW_START to config.py to set the exact start; falls
+    back to 14:45 if not set so this doesn't hard-crash if config hasn't
+    been updated yet.
+    """
+    now_t = datetime.datetime.now().time()
+    start = getattr(config, "BTST_ENTRY_WINDOW_START", datetime.time(14, 45))
+    return start <= now_t <= config.BTST_ENTRY_CUTOFF
+
+
+def _build_paper_trade_row(table: str, cfg: dict, row: dict) -> dict:
+    entry_price = row.get(cfg["price_column"])
+    stop_loss = row.get(cfg["stop_loss_column"]) if cfg["stop_loss_column"] else None
+    target = row.get(cfg["target_column"]) if cfg["target_column"] else None
+    trailing_sl = row.get(cfg["trailing_sl_column"]) if cfg["trailing_sl_column"] else None
+    lot_size = row.get(cfg["lot_size_column"]) if cfg["lot_size_column"] else None
+
+    sizing = decide_quantity(float(entry_price), lot_size)
+    if sizing["quantity"] <= 0:
+        return None, sizing["skipped_reason"]
+
+    trade_row = {
+        "leg": "STOCK",
+        "source_table": table,
+        "source_id": row.get("id"),
+        "symbol": row.get("symbol"),
+        "exchange": row.get("exchange"),
+        "segment": row.get("segment"),
+        "token": row.get("token"),
+        "option_type": row.get("option_type"),
+        "strike": row.get("strike"),
+        "expiry": row.get("expiry"),
+        "trade_type": cfg["fixed_trade_type"],
+        "strategy": row.get("strategy"),
+        "signal": row.get("signal"),
+        "entry_price": entry_price,
+        "cmp": entry_price,
+        "stop_loss": stop_loss,
+        "target_price": target,
+        "trailing_stop_loss": trailing_sl,
+        "highest_price": entry_price,
+        "lowest_price": entry_price,
+        "quantity": sizing["quantity"],
+        "invested_amount": sizing["invested_amount"],
+        "time_elapsed_minutes": 0,
+        "status": "OPEN",
+        "entry_time": datetime.datetime.utcnow().isoformat(),
+        "last_checked_at": datetime.datetime.utcnow().isoformat(),
+        "trade_date": datetime.date.today().isoformat(),
+        "details": row,
+    }
+    return trade_row, None
+
+
+def _build_option_trade_row(table: str, cfg: dict, row: dict):
+    """
+    Converts a plain stock signal into a trade on that stock's nearest ATM
+    option instead (STOCK_SIGNAL_MODE = "OPTIONS"/"BOTH"). Bullish signal
+    -> buy the ATM CE, bearish/short signal -> buy the ATM PE. Target/SL are
+    % of entry premium (config.OPTIONS_*_PCT_OF_PREMIUM) rather than the
+    stock signal's own price levels - an option's premium doesn't move 1:1
+    with the underlying, so those levels don't carry over meaningfully.
+
+    IMPORTANT: buying a PE on a bearish view is still a LONG position on
+    that option contract - the bot profits when the PE's own premium rises,
+    same mechanics as a long CE. So `signal` is deliberately set to
+    "BUY_<CE|PE>" here rather than copied from the stock row: _is_short()
+    downstream checks this field for "SELL"/"SHORT", and if the original
+    bearish stock signal text leaked through, the bot would misread its own
+    long PE as a short trade - flipping PnL sign, trailing-SL direction, and
+    which leg stamp duty/STT land on. The original stock-side signal is kept
+    in `details` for reference, just not in the field _is_short() reads.
+    """
+    underlying_symbol = row.get("symbol")
+    spot_price = row.get(cfg["price_column"])
+    if not underlying_symbol or spot_price is None:
+        return None, "missing_symbol_or_price"
+
+    option_type = "PE" if _is_short(row) else "CE"
+
+    try:
+        contract = get_atm_option(underlying_symbol, float(spot_price), option_type)
+    except NotImplementedError:
+        return None, "shoonya_not_wired"
+    except Exception as e:
+        scan_log.error("ATM option lookup failed for %s: %s", underlying_symbol, e)
+        return None, "option_lookup_failed"
+
+    if not contract or not contract.get("token"):
+        return None, "no_matching_option_contract"
+
+    try:
+        entry_premium = get_ltp(config.OPTIONS_EXCHANGE, contract["token"])
+    except Exception as e:
+        scan_log.error("Failed to fetch option LTP for %s: %s", contract["tradingsymbol"], e)
+        return None, "option_ltp_failed"
+
+    if not entry_premium or entry_premium <= 0:
+        return None, "invalid_option_premium"
+
+    sizing = decide_quantity(entry_premium, contract["lot_size"])
+    if sizing["quantity"] <= 0:
+        return None, sizing["skipped_reason"]
+
+    trade_row = {
+        "leg": "OPTION",
+        "source_table": table,
+        "source_id": row.get("id"),
+        "symbol": contract["tradingsymbol"],
+        "exchange": config.OPTIONS_EXCHANGE,
+        "segment": "NFO",
+        "token": contract["token"],
+        "option_type": option_type,
+        "strike": contract["strike"],
+        "expiry": contract["expiry"],
+        "trade_type": cfg["fixed_trade_type"],
+        "strategy": row.get("strategy"),
+        "signal": f"BUY_{option_type}",  # see docstring - never copy the stock's raw signal here
+        "entry_price": entry_premium,
+        "cmp": entry_premium,
+        "stop_loss": entry_premium * (1 - config.OPTIONS_STOP_LOSS_PCT_OF_PREMIUM),
+        "target_price": entry_premium * (1 + config.OPTIONS_TARGET_PCT_OF_PREMIUM),
+        "trailing_stop_loss": None,  # computed dynamically by _apply_trailing_sl, same as stocks
+        "highest_price": entry_premium,
+        "lowest_price": entry_premium,
+        "quantity": sizing["quantity"],
+        "invested_amount": sizing["invested_amount"],
+        "time_elapsed_minutes": 0,
+        "status": "OPEN",
+        "entry_time": datetime.datetime.utcnow().isoformat(),
+        "last_checked_at": datetime.datetime.utcnow().isoformat(),
+        "trade_date": datetime.date.today().isoformat(),
+        "details": {
+            "underlying_symbol": underlying_symbol,
+            "underlying_spot_at_entry": spot_price,
+            "underlying_signal": row.get("signal"),  # original stock-side direction, kept for reference only
+            "source_row": row,
+        },
+    }
+    return trade_row, None
+
+
+def scan_once():
+    """Single pass over all 5 source tables. Returns count of new trades logged."""
+    logged_count = 0
+    for table, cfg in config.SOURCE_TABLES.items():
+        if cfg["fixed_trade_type"] == "BTST" and not _btst_entry_window_open():
+            continue  # BTST entries only taken inside the 2:45-3:20 PM window
+
+        try:
+            rows = _fetch_new_rows(table, cfg)
+        except Exception as e:
+            scan_log.error("Failed to fetch from %s: %s", table, e)
+            continue
+
+        for row in rows:
+            source_id = row.get("id")
+            if source_id is None:
+                continue
+            if row.get(cfg["price_column"]) is None:
+                continue
+
+            # Decide stock vs. ATM-option (or both) for this signal. MCX is
+            # commodity futures, not NSE equity options, so it's always
+            # excluded regardless of STOCK_SIGNAL_MODE.
+            table_options_eligible = table in config.OPTIONS_ENABLED_SOURCE_TABLES
+            mode = config.STOCK_SIGNAL_MODE if table_options_eligible else "STOCK"
+
+            builders = []
+            if mode in ("STOCK", "BOTH"):
+                builders.append((_build_paper_trade_row, "STOCK"))
+            if mode in ("OPTIONS", "BOTH"):
+                builders.append((_build_option_trade_row, "OPTION"))
+
+            for build_fn, leg in builders:
+                # per-leg dedup: a stock leg already logged for this
+                # source_id must not block the option leg (or vice versa)
+                # from retrying on a later scan.
+                if _already_logged(table, source_id, leg):
+                    continue
+
+                paper_row, skip_reason = build_fn(table, cfg, row)
+                if paper_row is None:
+                    scan_log.info("Skipped %s#%s (%s) via %s: %s",
+                                   table, source_id, row.get("symbol"), build_fn.__name__, skip_reason)
+                    continue
+
+                try:
+                    insert(config.PAPER_TRADING_TABLE, paper_row)
+                    logged_count += 1
+                    scan_log.info(
+                        "Logged new %s trade: %s (%s) qty=%s @ %s invested=%.2f leg=%s",
+                        paper_row["trade_type"], paper_row["symbol"], table,
+                        paper_row["quantity"], paper_row["entry_price"], paper_row["invested_amount"], leg,
+                    )
+                except Exception as e:
+                    scan_log.error("Failed to insert paper trade for %s#%s (%s): %s", table, source_id, leg, e)
+
+    return logged_count
+
+# ===========================================================================
+# 3. Live trade management
+# ===========================================================================
+tm_log = logging.getLogger("trade_manager")
+
+def _is_short(row: dict) -> bool:
+    signal = (row.get("signal") or "").upper()
+    return "SELL" in signal or "SHORT" in signal
+
+
+def _session_end_for(row: dict) -> datetime.time:
+    if (row.get("segment") or "").upper() in config.MCX_SEGMENTS:
+        return config.MCX_END
+    return config.EQUITY_INDEX_END
+
+
+def _minutes_since(entry_time_iso: str) -> float:
+    try:
+        entry_dt = datetime.datetime.fromisoformat(entry_time_iso.replace("Z", "+00:00"))
+    except Exception:
+        return 0.0
+    now = datetime.datetime.now(datetime.timezone.utc)
+    if entry_dt.tzinfo is None:
+        entry_dt = entry_dt.replace(tzinfo=datetime.timezone.utc)
+    return round((now - entry_dt).total_seconds() / 60.0, 1)
+
+
+def _apply_trailing_sl(row: dict, cmp_price: float, short: bool) -> dict:
+    """
+    Staged trailing SL, applied in order of how far a trade has moved into
+    profit (each stage only fires once the prior one's trigger is passed;
+    the ratchet check against current_trail still guarantees the SL only
+    ever moves in the trade's favor, never back out):
+
+      Stage 1 (BREAKEVEN_TRIGGER_PCT reached)  -> SL moves to entry_price
+                                                   (cost-to-cost, risk-free)
+      Stage 2 (TRAIL_LOCK_TRIGGER_PCT reached)  -> SL moves to a locked-in
+                                                   profit level (TRAIL_LOCK_PCT)
+      Stage 3 (rule["trail_trigger_pct"] reached, this is the pre-existing
+               continuous trail) -> SL steps up/down by rule["trail_step_pct"]
+               for every further move, per trade_type in TRAIL_RULES
+
+    Stage 3's own trigger is expected to be set higher than stage 2's, so
+    once price runs far enough the continuous trail takes over from the
+    flat profit-lock. BREAKEVEN_TRIGGER_PCT / TRAIL_LOCK_TRIGGER_PCT /
+    TRAIL_LOCK_PCT are optional in config.py - if unset, stages 1 and 2 are
+    skipped and behavior is identical to the old single-stage trail.
+    """
+    trade_type = row.get("trade_type") or "INTRADAY"
+    rule = config.TRAIL_RULES.get(trade_type, config.TRAIL_RULES["INTRADAY"])
+    entry_price = float(row["entry_price"])
+    updates = {}
+
+    breakeven_trigger = getattr(config, "BREAKEVEN_TRIGGER_PCT", None)
+    lock_trigger = getattr(config, "TRAIL_LOCK_TRIGGER_PCT", None)
+    lock_pct = getattr(config, "TRAIL_LOCK_PCT", None)
+
+    current_trail = row.get("trailing_stop_loss")
+    current_trail = float(current_trail) if current_trail is not None else None
+
+    if not short:
+        highest = max(float(row.get("highest_price") or entry_price), cmp_price)
+        updates["highest_price"] = highest
+        move_pct = (highest - entry_price) / entry_price if entry_price else 0
+
+        candidate = None
+        if move_pct >= rule["trail_trigger_pct"]:
+            candidate = highest * (1 - rule["trail_step_pct"])
+        elif lock_trigger is not None and lock_pct is not None and move_pct >= lock_trigger:
+            candidate = entry_price * (1 + lock_pct)
+        elif breakeven_trigger is not None and move_pct >= breakeven_trigger:
+            candidate = entry_price
+
+        if candidate is not None and (current_trail is None or candidate > current_trail):
+            updates["trailing_stop_loss"] = candidate
+    else:
+        lowest = min(float(row.get("lowest_price") or entry_price), cmp_price)
+        updates["lowest_price"] = lowest
+        move_pct = (entry_price - lowest) / entry_price if entry_price else 0
+
+        candidate = None
+        if move_pct >= rule["trail_trigger_pct"]:
+            candidate = lowest * (1 + rule["trail_step_pct"])
+        elif lock_trigger is not None and lock_pct is not None and move_pct >= lock_trigger:
+            candidate = entry_price * (1 - lock_pct)
+        elif breakeven_trigger is not None and move_pct >= breakeven_trigger:
+            candidate = entry_price
+
+        if candidate is not None and (current_trail is None or candidate < current_trail):
+            updates["trailing_stop_loss"] = candidate
+
+    return updates
+
+
+def _pnl(entry_price: float, exit_price: float, quantity: float, short: bool) -> float:
+    diff = (exit_price - entry_price) if not short else (entry_price - exit_price)
+    return diff * quantity
+
+
+def _dp_charged_today(paper_trade_id) -> bool:
+    """
+    True if this paper_trade_id already has a Profit Log entry logged today
+    (i.e. a DP charge has already been billed today for this position).
+    Real DP (depository participant) charges are billed once per scrip per
+    settlement day, not once per sell execution - so a same-day partial
+    exit followed by a same-day full exit must only be charged DP once.
+    Used to gate charge_dp on the *second* (or later) exit of the same
+    trade on the same calendar day.
+    """
+    if paper_trade_id is None:
+        return False
+    today = datetime.date.today().isoformat()
+    rows = select(
+        config.PROFIT_LOG_TABLE,
+        params={
+            "select": "id",
+            "paper_trade_id": f"eq.{paper_trade_id}",
+            "log_date": f"eq.{today}",
+            "limit": "1",
+        },
+    )
+    return len(rows) > 0
+
+
+def _log_profit_entry(row: dict, exit_price: float, exit_qty: float, event_type: str, exit_reason: str):
+    entry_price = float(row["entry_price"])
+    short = _is_short(row)
+    gross_pnl = _pnl(entry_price, exit_price, exit_qty, short)
+
+    # Only charge DP once per scrip per day - check BEFORE inserting this
+    # exit's own row, so the first exit today charges it and any later
+    # exit of the same trade on the same day does not double-charge it.
+    charge_dp = not _dp_charged_today(row.get("id"))
+
+    temp_row = dict(row)
+    temp_row["quantity"] = exit_qty
+    temp_row["pnl"] = gross_pnl
+    charges = compute_charges(temp_row, exit_price, is_short=short, charge_dp=charge_dp)
+
+    invested_amount = entry_price * exit_qty
+
+    insert(config.PROFIT_LOG_TABLE, {
+        "paper_trade_id": row.get("id"),
+        # local date, matching the local date used by daily/weekly/monthly
+        # report filters (_write_report uses datetime.date.today())
+        "log_date": datetime.date.today().isoformat(),
+        "log_time": datetime.datetime.utcnow().isoformat(),
+        "source_table": row.get("source_table"),
+        "symbol": row.get("symbol"),
+        "exchange": row.get("exchange"),
+        "segment": row.get("segment"),
+        "trade_type": row.get("trade_type"),
+        "strategy": row.get("strategy"),
+        "signal": row.get("signal"),
+        "entry_price": entry_price,
+        "exit_price": exit_price,
+        "stop_loss": row.get("stop_loss"),
+        "target_price": row.get("target_price"),
+        "trailing_stop_loss": row.get("trailing_stop_loss"),
+        "exit_reason": exit_reason,
+        "quantity": exit_qty,
+        "invested_amount": invested_amount,
+        "pnl": gross_pnl,
+        "net_pnl": charges["net_pnl"],
+        "pnl_percent": (gross_pnl / invested_amount * 100) if invested_amount else 0,
+        "time_elapsed_minutes": _minutes_since(row.get("entry_time")),
+        "event_type": event_type,
+    })
+    return gross_pnl, charges
+
+
+def _close_trade(row: dict, exit_price: float, reason: str, extra_updates: dict = None):
+    exit_qty = float(row.get("quantity") or 0)
+    gross_pnl, charges = _log_profit_entry(row, exit_price, exit_qty, "FULL_EXIT", reason)
+
+    values = {
+        "status": "CLOSED",
+        "cmp": exit_price,
+        "exit_price": exit_price,
+        "exit_reason": reason,
+        "pnl": gross_pnl,
+        "brokerage": charges["brokerage"],
+        "net_pnl": charges["net_pnl"],
+        "pnl_percent": (gross_pnl / (exit_qty * float(row["entry_price"])) * 100) if exit_qty else 0,
+        "time_elapsed_minutes": _minutes_since(row.get("entry_time")),
+        "exit_time": datetime.datetime.utcnow().isoformat(),
+        "last_checked_at": datetime.datetime.utcnow().isoformat(),
+        # carries quantity/invested_amount/partial_exit_* if a partial
+        # booking fired in this same price-update pass, right before this
+        # full exit - without this, a same-tick partial+full close would
+        # leave quantity/invested_amount on the closed row at their
+        # original pre-partial values, even though Profit Log correctly
+        # recorded both events at the right split quantities.
+        **(extra_updates or {}),
+    }
+    update(config.PAPER_TRADING_TABLE, match={"id": f"eq.{row['id']}"}, values=values)
+    tm_log.info("Closed trade #%s %s (%s): exit=%s reason=%s gross_pnl=%.2f net_pnl=%.2f",
+              row["id"], row["symbol"], row["trade_type"], exit_price, reason, gross_pnl, charges["net_pnl"])
+
+
+def _maybe_partial_book(row: dict, cmp_price: float, short: bool) -> dict:
+    """Books half the position once price is halfway to target, for STOCK
+    (equity) trades only - options and futures run to full target/SL/trail
+    instead. Returns update dict."""
+    if row.get("partial_exit_done"):
+        return {}
+    if classify_segment(row) not in ("EQUITY_INTRADAY", "EQUITY_DELIVERY"):
+        return {}
+    target = row.get("target_price")
+    entry_price = float(row["entry_price"])
+    quantity = float(row.get("quantity") or 0)
+    if target is None or quantity < 2:
+        return {}
+
+    target = float(target)
+    distance = abs(target - entry_price)
+    if distance <= 0:
+        return {}
+    trigger_price = (
+        entry_price + distance * config.PARTIAL_BOOKING_TRIGGER_PCT_OF_TARGET
+        if not short else
+        entry_price - distance * config.PARTIAL_BOOKING_TRIGGER_PCT_OF_TARGET
+    )
+
+    reached = cmp_price >= trigger_price if not short else cmp_price <= trigger_price
+    if not reached:
+        return {}
+
+    partial_qty = int(quantity * config.PARTIAL_BOOKING_FRACTION)
+    if partial_qty < 1:
+        return {}
+
+    gross_pnl, _ = _log_profit_entry(row, cmp_price, partial_qty, "PARTIAL_EXIT", "PARTIAL_PROFIT_BOOKED")
+
+    remaining_qty = quantity - partial_qty
+    invested_amount = remaining_qty * entry_price
+    tm_log.info("Partial booking on #%s %s: booked %s qty @ %s (pnl=%.2f), %s qty left running",
+              row["id"], row["symbol"], partial_qty, cmp_price, gross_pnl, remaining_qty)
+
+    return {
+        "quantity": remaining_qty,
+        "invested_amount": invested_amount,
+        "partial_exit_done": True,
+        "partial_exit_quantity": partial_qty,
+        "partial_exit_price": cmp_price,
+        "partial_exit_pnl": gross_pnl,
+    }
+
+
+def _check_exit(row: dict, cmp_price: float, short: bool):
+    target = row.get("target_price")
+    stop_loss = row.get("stop_loss")
+    trailing_sl = row.get("trailing_stop_loss")
+
+    if not short:
+        if target is not None and cmp_price >= float(target):
+            return True, "TARGET_HIT"
+        if trailing_sl is not None and cmp_price <= float(trailing_sl):
+            return True, "TRAIL_SL_HIT"
+        if stop_loss is not None and cmp_price <= float(stop_loss):
+            return True, "SL_HIT"
+    else:
+        if target is not None and cmp_price <= float(target):
+            return True, "TARGET_HIT"
+        if trailing_sl is not None and cmp_price >= float(trailing_sl):
+            return True, "TRAIL_SL_HIT"
+        if stop_loss is not None and cmp_price >= float(stop_loss):
+            return True, "SL_HIT"
+
+    return False, None
+
+
+def _btst_morning_window_now() -> bool:
+    now_time = datetime.datetime.now().time()
+    return config.BTST_MORNING_CHECK_START <= now_time <= config.BTST_MORNING_CHECK_END
+
+
+def _btst_morning_management(row: dict, cmp_price: float, short: bool) -> dict:
+    """
+    Two-target next-morning BTST exit, run only inside the
+    BTST_MORNING_CHECK_START/END window (default 9:15-9:45 AM):
+      Target 1 hit -> book BTST_TARGET1_BOOK_FRACTION of the position
+      Target 2 hit -> close whatever quantity remains
+    Both targets are optional in config.py (BTST_TARGET1_PCT,
+    BTST_TARGET1_BOOK_FRACTION, BTST_TARGET2_PCT) - if unset, sensible
+    defaults are used (1% / 50% / 2%) so this doesn't hard-crash if
+    config hasn't been updated yet; set real values in config.py for
+    production use.
+
+    Returns an update dict for the caller to merge into `row` and into
+    `partial_updates`. If Target 2 fired, the trade has already been fully
+    closed (via _close_trade) inside this function - the returned dict
+    then also carries "_closed": True so the caller knows to stop
+    processing this row for the rest of this pass.
+    """
+    entry_price = float(row["entry_price"])
+    quantity = float(row.get("quantity") or 0)
+    if quantity <= 0:
+        return {}
+
+    t1_pct = getattr(config, "BTST_TARGET1_PCT", 0.01)
+    t1_frac = getattr(config, "BTST_TARGET1_BOOK_FRACTION", 0.5)
+    t2_pct = getattr(config, "BTST_TARGET2_PCT", 0.02)
+
+    t1_price = entry_price * (1 + t1_pct) if not short else entry_price * (1 - t1_pct)
+    t2_price = entry_price * (1 + t2_pct) if not short else entry_price * (1 - t2_pct)
+
+    updates = {}
+
+    if not row.get("partial_exit_done"):
+        hit_t1 = cmp_price >= t1_price if not short else cmp_price <= t1_price
+        if hit_t1:
+            partial_qty = int(quantity * t1_frac)
+            if partial_qty >= 1:
+                gross_pnl, _ = _log_profit_entry(row, cmp_price, partial_qty, "PARTIAL_EXIT", "BTST_TARGET1_BOOKED")
+                remaining_qty = quantity - partial_qty
+                updates.update({
+                    "quantity": remaining_qty,
+                    "invested_amount": remaining_qty * entry_price,
+                    "partial_exit_done": True,
+                    "partial_exit_quantity": partial_qty,
+                    "partial_exit_price": cmp_price,
+                    "partial_exit_pnl": gross_pnl,
+                })
+                tm_log.info("BTST T1 booked on #%s %s: %s qty @ %s (pnl=%.2f), %s qty left running",
+                            row["id"], row["symbol"], partial_qty, cmp_price, gross_pnl, remaining_qty)
+
+    remaining_qty_now = updates.get("quantity", quantity)
+    hit_t2 = cmp_price >= t2_price if not short else cmp_price <= t2_price
+    if hit_t2 and remaining_qty_now > 0:
+        merged_row = {**row, **updates}
+        _close_trade(merged_row, cmp_price, "BTST_TARGET2_BOOKED", extra_updates=updates)
+        updates["_closed"] = True
+
+    return updates
+
+
+def update_open_trades():
+    open_trades = select(
+        config.PAPER_TRADING_TABLE,
+        params={"select": "*", "status": "eq.OPEN", "limit": "1000"},
+    )
+
+    now_time = datetime.datetime.now().time()
+    today = datetime.date.today().isoformat()
+
+    for row in open_trades:
+        exchange = row.get("exchange")
+        token = row.get("token")
+        if not exchange or not token:
+            continue
+
+        try:
+            cmp_price = get_ltp(exchange, token)
+        except Exception as e:
+            tm_log.warning("Could not fetch LTP for %s (%s/%s): %s", row["symbol"], exchange, token, e)
+            continue
+
+        short = _is_short(row)
+        trail_updates = _apply_trailing_sl(row, cmp_price, short)
+        row.update(trail_updates)
+
+        # partial profit booking (stocks only - see _maybe_partial_book)
+        partial_updates = _maybe_partial_book(row, cmp_price, short)
+        row.update(partial_updates)
+
+        should_exit, reason = _check_exit(row, cmp_price, short)
+
+        # BTST: two-target next-morning exit (9:15-9:45 AM window), with a
+        # hard time-stop at the end of that window if neither target hit.
+        if not should_exit and row.get("trade_type") == "BTST" and row.get("trade_date") != today:
+            if _btst_morning_window_now():
+                btst_updates = _btst_morning_management(row, cmp_price, short)
+                if btst_updates.get("_closed"):
+                    # Target 2 fired - _btst_morning_management already
+                    # closed and wrote the trade. Nothing left to do for
+                    # this row this pass.
+                    continue
+                if btst_updates:
+                    row.update(btst_updates)
+                    partial_updates = {**partial_updates, **btst_updates}
+            elif datetime.datetime.now().time() > config.BTST_MORNING_CHECK_END:
+                # Window has closed for today and neither target hit -
+                # hard auto-squareoff at whatever quantity remains.
+                should_exit, reason = True, "BTST_HARD_TIME_STOP"
+
+        # EOD squareoff for intraday trades whose session has ended
+        if not should_exit and row.get("trade_type") == "INTRADAY" and config.EOD_SQUAREOFF_INTRADAY:
+            if now_time >= _session_end_for(row):
+                should_exit, reason = True, "EOD_SQUAREOFF"
+
+        if should_exit:
+            _close_trade(row, cmp_price, reason, extra_updates=partial_updates)
+        else:
+            # live (unrealized) PNL - keeps Paper Trading up to date even
+            # while the trade is still running, not just at exit
+            quantity = float(row.get("quantity") or 0)
+            entry_price = float(row["entry_price"])
+            invested_amount = float(row.get("invested_amount") or (quantity * entry_price))
+            unrealized_pnl = _pnl(entry_price, cmp_price, quantity, short)
+            unrealized_pnl_pct = (unrealized_pnl / invested_amount * 100) if invested_amount else 0
+
+            update_values = {
+                "cmp": cmp_price,
+                "pnl": unrealized_pnl,
+                "pnl_percent": unrealized_pnl_pct,
+                "last_checked_at": datetime.datetime.utcnow().isoformat(),
+                "time_elapsed_minutes": _minutes_since(row.get("entry_time")),
+                **trail_updates,
+                **partial_updates,
+            }
+            update(config.PAPER_TRADING_TABLE, match={"id": f"eq.{row['id']}"}, values=update_values)
+
+# ===========================================================================
+# 4. Reporting
+# ===========================================================================
+reports_log = logging.getLogger("reports")
+
+def _profit_log_between(start_date: datetime.date, end_date: datetime.date):
+    return select(
+        config.PROFIT_LOG_TABLE,
+        params={
+            "select": "*",
+            "log_date": f"gte.{start_date.isoformat()}",
+            "and": f"(log_date.lte.{end_date.isoformat()})",
+            "order": "log_date.asc,log_time.asc",
+        },
+    )
+
+
+def _open_positions_snapshot():
+    return select(
+        config.PAPER_TRADING_TABLE,
+        params={"select": "*", "status": "eq.OPEN", "order": "entry_time.asc"},
+    )
+
+
+def _summarize(entries: list) -> dict:
+    total = len(entries)
+    wins = [e for e in entries if (e.get("net_pnl") or e.get("pnl") or 0) > 0]
+    losses = [e for e in entries if (e.get("net_pnl") or e.get("pnl") or 0) <= 0]
+    total_gross_pnl = sum(float(e.get("pnl") or 0) for e in entries)
+    total_net_pnl = sum(float(e.get("net_pnl") or e.get("pnl") or 0) for e in entries)
+
+    by_type = {}
+    for e in entries:
+        tt = e.get("trade_type") or "UNKNOWN"
+        by_type.setdefault(tt, {"count": 0, "gross_pnl": 0.0, "net_pnl": 0.0})
+        by_type[tt]["count"] += 1
+        by_type[tt]["gross_pnl"] += float(e.get("pnl") or 0)
+        by_type[tt]["net_pnl"] += float(e.get("net_pnl") or e.get("pnl") or 0)
+
+    return {
+        "total_events": total,
+        "wins": len(wins),
+        "losses": len(losses),
+        "win_rate_pct": (len(wins) / total * 100) if total else 0,
+        "total_gross_pnl": total_gross_pnl,
+        "total_net_pnl": total_net_pnl,
+        "by_type": by_type,
+    }
+
+
+def _write_report(label: str, start_date: datetime.date, end_date: datetime.date):
+    entries = _profit_log_between(start_date, end_date)
+    summary = _summarize(entries)
+    open_positions = _open_positions_snapshot()
+    deployed_capital = get_deployed_capital()
+    available_capital = get_available_capital()
+
+    os.makedirs(config.REPORTS_DIR, exist_ok=True)
+    stamp = end_date.isoformat()
+
+    # --- realized PNL CSV (from Profit Log) ---
+    csv_path = os.path.join(config.REPORTS_DIR, f"{label}_{stamp}_profit_log.csv")
+    fieldnames = [
+        "id", "symbol", "trade_type", "strategy", "event_type", "entry_price", "exit_price",
+        "quantity", "invested_amount", "pnl", "net_pnl", "pnl_percent", "exit_reason",
+        "time_elapsed_minutes", "log_date", "log_time",
+    ]
+    with open(csv_path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
+        writer.writeheader()
+        for e in entries:
+            writer.writerow(e)
+
+    # --- open positions snapshot CSV ---
+    open_csv_path = os.path.join(config.REPORTS_DIR, f"{label}_{stamp}_open_positions.csv")
+    open_fieldnames = [
+        "id", "symbol", "trade_type", "strategy", "entry_price", "cmp", "quantity",
+        "invested_amount", "stop_loss", "target_price", "trailing_stop_loss",
+        "time_elapsed_minutes", "trade_date", "entry_time",
+    ]
+    with open(open_csv_path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=open_fieldnames, extrasaction="ignore")
+        writer.writeheader()
+        for p in open_positions:
+            writer.writerow(p)
+
+    # --- text summary ---
+    txt_path = os.path.join(config.REPORTS_DIR, f"{label}_{stamp}_summary.txt")
+    with open(txt_path, "w") as f:
+        f.write(f"Paper Trading {label.title()} Report: {start_date} to {end_date}\n")
+        f.write("=" * 65 + "\n\n")
+        f.write(f"Realized events : {summary['total_events']}\n")
+        f.write(f"Wins / Losses   : {summary['wins']} / {summary['losses']}\n")
+        f.write(f"Win rate        : {summary['win_rate_pct']:.1f}%\n")
+        f.write(f"Gross PNL       : Rs {summary['total_gross_pnl']:.2f}\n")
+        f.write(f"Net PNL (post-brokerage): Rs {summary['total_net_pnl']:.2f}\n\n")
+        f.write("By trade type:\n")
+        for tt, stats in summary["by_type"].items():
+            f.write(f"  {tt:10s} events={stats['count']:4d}  gross={stats['gross_pnl']:10.2f}  net={stats['net_pnl']:10.2f}\n")
+
+        f.write(f"\nOpen positions right now: {len(open_positions)}\n")
+        f.write(f"Capital deployed : Rs {deployed_capital:.2f} of Rs {config.DEPLOYABLE_BUDGET_INR:.2f} deployable\n")
+        f.write(f"Capital available: Rs {available_capital:.2f}\n")
+        f.write(f"(Total budget Rs {config.TOTAL_BUDGET_INR:,.0f}, {config.CAPITAL_BUFFER_PCT*100:.0f}% buffer held back)\n")
+
+    print(f"Wrote {csv_path}, {open_csv_path}, and {txt_path}")
+    return csv_path, open_csv_path, txt_path
+
+
+def daily_report(for_date: datetime.date = None):
+    d = for_date or datetime.date.today()
+    return _write_report("daily", d, d)
+
+
+def weekly_report(for_date: datetime.date = None):
+    d = for_date or datetime.date.today()
+    start = d - datetime.timedelta(days=d.weekday())
+    return _write_report("weekly", start, d)
+
+
+def monthly_report(for_date: datetime.date = None):
+    d = for_date or datetime.date.today()
+    start = d.replace(day=1)
+    return _write_report("monthly", start, d)
+
+
+# ===========================================================================
+# 5. Continuous run loop (was main.py)
+#    Runs forever on the VPS:
+#      - every SIGNAL_SCAN_INTERVAL_SECONDS: scan the 5 source tables for
+#        new entries
+#      - every PRICE_UPDATE_INTERVAL_SECONDS: refresh live prices on open
+#        trades, apply trailing SL, close hits / EOD squareoffs
+#    Only does work while at least one relevant market session is open.
+#    Suggested deployment: run as a systemd service, or
+#    `nohup python3 trading.py > bot.log 2>&1 &`.
+# ===========================================================================
+run_log = logging.getLogger("main")
+
+
+def market_is_open() -> bool:
+    now = datetime.datetime.now().time()
+    equity_open = config.EQUITY_INDEX_START <= now <= config.EQUITY_INDEX_END
+    mcx_open = config.MCX_START <= now <= config.MCX_END
+    return equity_open or mcx_open
+
+
+def run():
+    run_log.info("Paper trading bot starting up.")
+    last_scan = 0.0
+    last_price_update = 0.0
+
+    while True:
+        now = time.time()
+
+        if market_is_open():
+            if now - last_scan >= config.SIGNAL_SCAN_INTERVAL_SECONDS:
+                try:
+                    n = scan_once()
+                    if n:
+                        run_log.info("Scan complete: %d new trade(s) logged.", n)
+                except Exception:
+                    run_log.exception("Error during signal scan")
+                last_scan = now
+
+            if now - last_price_update >= config.PRICE_UPDATE_INTERVAL_SECONDS:
+                try:
+                    update_open_trades()
+                except Exception:
+                    run_log.exception("Error during trade update pass")
+                last_price_update = now
+        else:
+            run_log.debug("Market closed, idling.")
+
+        time.sleep(5)
+
+
+# ===========================================================================
+# 6. Connectivity test (run manually on the VPS - see README)
+# ===========================================================================
+conn_log = logging.getLogger("test_connectivity")
+
+
+def test_connectivity(limit: int = 5):
+    """
+    Read-only sanity check to run on the VPS before trusting the bot to
+    trade unattended. Confirms:
+      - Supabase is reachable and each of the 5 source tables returns rows
+      - stock/index rows carry a usable CMP (price_column)
+      - option rows (e.g. breakout signals) carry ATM option_type/strike/token,
+        confirming the source table is feeding through what scan_once() needs
+      - whether the Shoonya session has been wired up (get_ltp will work)
+    This does NOT place trades or touch "Paper Trading" - it only reads.
+    Run: python3 trading.py test-connectivity [limit]
+    """
+    print(f"Testing Supabase connectivity ({config.SUPABASE_URL}) ...\n")
+    any_failed = False
+
+    for table, cfg in config.SOURCE_TABLES.items():
+        try:
+            rows = select(table, params={"select": "*", "order": "id.desc", "limit": str(limit)})
+        except Exception as e:
+            print(f"[{table}] FAILED: {e}")
+            any_failed = True
+            continue
+
+        print(f"[{table}] {len(rows)} row(s):")
+        for r in rows:
+            symbol = r.get("symbol")
+            price = r.get(cfg["price_column"])
+            option_type = r.get("option_type")
+            strike = r.get("strike")
+            token = r.get("token")
+            if option_type:
+                print(f"    {symbol}  {option_type} {strike}  cmp={price}  token={token}")
+            else:
+                print(f"    {symbol}  cmp={price}  token={token}")
+        print()
+
+    print("Testing Shoonya live-price feed ...")
+    if is_shoonya_reachable():
+        print("  Shoonya API host is reachable (network path OK, no login needed for this check).")
+    else:
+        print("  Shoonya API host is NOT reachable - check VPS network/firewall/DNS.")
+        any_failed = True
+
+    try:
+        _get_shoonya_client()
+        print("  Shoonya session wired up and verified live (injectOAuthHeader + get_limits OK).")
+    except ModuleNotFoundError as e:
+        if e.name == "shoonya_connection":
+            # shoonya_connection.py hasn't been created yet on this VPS -
+            # this is an expected "not wired up yet" state, not a failure
+            # of anything that IS wired up. Doesn't affect the Supabase
+            # checks above, and doesn't count toward any_failed so it
+            # won't block the rest of the connectivity test from passing.
+            print("  NOT WIRED UP: shoonya_connection.py doesn't exist yet on this VPS.")
+            print("  (Live price fetching / trade management will not work until it's created -")
+            print("   see the _get_shoonya_client() docstring in trading.py for what it needs to expose.)")
+        else:
+            print(f"  FAILED: {e}")
+            any_failed = True
+    except FileNotFoundError:
+        print(f"  FAILED: cred.yaml not found at config.SHOONYA_CRED_PATH ({config.SHOONYA_CRED_PATH}).")
+        any_failed = True
+    except Exception as e:
+        print(f"  FAILED: Shoonya session rejected - {e}")
+        print("  (Access_token in cred.yaml may be expired - it's a per-day OAuth token, see "
+              "_get_shoonya_client()'s docstring in trading.py.)")
+        any_failed = True
+
+    print("\nResult:", "some checks failed - see above" if any_failed else "all checks passed")
+    return not any_failed
+
+
+if __name__ == "__main__":
+    # No args: continuous run loop (was `python3 main.py`)
+    #   python3 trading.py
+    # Standalone report runner:
+    #   python3 trading.py report daily|weekly|monthly
+    # Connectivity smoke test:
+    #   python3 trading.py test-connectivity [limit]
+    if len(sys.argv) > 1 and sys.argv[1] == "report":
+        which = sys.argv[2] if len(sys.argv) > 2 else "daily"
+        {"daily": daily_report, "weekly": weekly_report, "monthly": monthly_report}[which]()
+    elif len(sys.argv) > 1 and sys.argv[1] == "test-connectivity":
+        n = int(sys.argv[2]) if len(sys.argv) > 2 else 5
+        test_connectivity(n)
+    elif len(sys.argv) > 1:
+        print("Usage: python3 trading.py                       (run the bot continuously)")
+        print("       python3 trading.py report daily|weekly|monthly")
+        print("       python3 trading.py test-connectivity [limit]")
+    else:
+        logging.basicConfig(
+            level=logging.INFO,
+            format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        )
+        run()
