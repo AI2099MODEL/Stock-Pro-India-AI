@@ -1,63 +1,56 @@
-# Gemini Revenue Engine 01 - Institutional AI Trading Terminal
+# Stock Pro Local - Institutional Algorithmic Trading Terminal
 
-A professional-grade, high-performance algorithmic trading terminal and autonomous revenue engine powered by **Google Gemini AI Studio** and **Supabase**, with a **FastAPI** Python backend and modern **Canvas & CSS** trading interface.
-
----
-
-## ✨ Features
-
-- ⚡ **Interactive High-Performance Candlestick & Volume Chart**: HTML5 Canvas engine with EMA (21/50), Bollinger Bands, crosshairs, dynamic zoom, and multi-timeframe navigation (`1m`, `5m`, `15m`, `1h`, `1D`).
-- 🤖 **Gemini AI Studio Agent**: Deep technical market structure synthesis, generating institutional Buy/Sell/Hold setups with Confidence %, Entry targets, Stop Loss, Risk-Reward ratios, and trade rationales.
-- 💬 **Gemini Copilot Interactive Chat**: Instant quant analysis and portfolio risk assessment directly in the terminal.
-- 📊 **Real-time Order Execution & Paper Trading**: Market and Limit orders with leverage up to 50x, live position margin calculation, mark-to-market unrealized PnL, and position liquidation tracking.
-- 🗄️ **Supabase Database Integration**: Seamless sync for `trades`, `positions`, `ai_signals`, and `portfolio_logs` with a built-in live database table inspector.
-- 📡 **WebSocket Real-time Feed**: Low-latency ticker stream, live price updates, and trade ledger updates.
+A high-performance, connectivity-first local trading terminal and autonomous revenue engine powered by **Shoonya (Finvasia)**, **Dhan HQ v2**, **Google Gemini AI**, and **Supabase**.
 
 ---
 
 ## 🚀 Quick Start
 
-### 1. Install Dependencies
-```bash
-pip install -r requirements.txt
-```
-
-### 2. Configure Environment Variables (Optional)
-Copy `.env.example` to `.env` or configure directly within the UI settings:
+### 1. Configure Environment Variables
+Copy `backend/.env.example` to `backend/.env` (or root `.env`):
 ```bash
 cp backend/.env.example backend/.env
 ```
-Add your credentials:
+Fill in your broker credentials and Supabase keys:
 ```env
-GEMINI_API_KEY=your_gemini_api_key_here
-GEMINI_MODEL=gemini-2.5-flash
 SUPABASE_URL=https://your-project.supabase.co
-SUPABASE_KEY=your_supabase_anon_key
+SUPABASE_SERVICE_KEY=your-supabase-service-key
+SHOONYA_USER_ID=your-user-id
+SHOONYA_PASSWORD=your-password
+SHOONYA_TOTP_SECRET=your-totp-secret
+SHOONYA_VENDOR_CODE=your-vendor-code
+SHOONYA_API_SECRET=your-api-secret
+SHOONYA_IMEI=your-device-imei
+DHAN_CLIENT_ID=your-dhan-client-id
+DHAN_ACCESS_TOKEN=your-dhan-access-token
+```
+
+### 2. Connectivity Self-Test
+Run the single diagnostic script to verify database and broker sessions before launching:
+```bash
+python backend/check_connections.py
 ```
 
 ### 3. Run the Terminal
+Single-command launcher starts both the API server and UI on localhost:
 ```bash
-python run.py
+start_terminal.bat
 ```
-Open **http://localhost:8000** in your browser.
+*(Or manually: `python run.py`)*
+
+Open **http://127.0.0.1:8000** in your browser.
+API Swagger Docs: **http://127.0.0.1:8000/docs**
 
 ---
 
-## 🗃️ Supabase Database Schema
+## 🏗️ Architecture & Modules
 
-To set up the database tables in your Supabase project, execute the SQL script in `backend/supabase_schema.sql` inside the **Supabase SQL Editor**:
-- `trades` - Executed and closed trades ledger
-- `positions` - Active open margin positions
-- `ai_signals` - Real-time AI prediction history
-- `portfolio_logs` - Historical equity & balance tracking
-
----
-
-## 🏗️ Architecture
-
-```
-d:/Antigravity/
-├── backend/
+- **`backend/brokers/shoonya.py`**: Safe wrapper for Shoonya NorenApi / REST API (`login`, `get_positions`, `get_holdings`, `get_ltp`, `place_order`, `test_connection`).
+- **`backend/brokers/dhan.py`**: Safe wrapper for Dhan HQ API v2 (`get_holdings`, `get_positions`, `get_fund_limits`, `get_order_book`, `test_connection`).
+- **`backend/routes/dhan_portfolio.py`**: Real-time consolidated portfolio aggregator with 15s background in-memory cache.
+- **`backend/signal_writer.py`**: Schema-validated writer for all 7 signal tables (`intraday_signals`, `mcx_intraday_signals`, `btst_signals`, `weekly_momentum_signals`, `stock_options_signals`, `index_breakout_signals`, `breakouts`).
+- **`backend/scanner.py`**: Asynchronous breakout/breakdown scanner loop targeting active watchlist symbols (MCX + Index + Equities).
+- **`backend/routes/signals.py`**: Multi-table signal stream endpoints & status summary strip.
 │   ├── config.py             # Environment & settings loader
 │   ├── gemini_agent.py       # Google Gemini AI Studio trading agent
 │   ├── supabase_client.py    # Supabase CRUD manager & offline fallback

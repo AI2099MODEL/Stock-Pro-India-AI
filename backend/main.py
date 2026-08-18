@@ -20,6 +20,11 @@ from backend.gemini_agent import gemini_agent
 from backend.shoonya_service import shoonya_service
 from backend.dhan_service import dhan_service
 from backend.nifty200_service import nifty200_engine
+from backend.brokers.shoonya import shoonya_client
+from backend.brokers.dhan import dhan_client
+from backend.routes.dhan_portfolio import router as dhan_router, start_dhan_portfolio_polling_task
+from backend.routes.signals import router as signals_router
+from backend.scanner import scanner_engine
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("api_server")
@@ -29,6 +34,9 @@ app = FastAPI(
     version=settings.VERSION,
     description="Algorithmic Trading Research & Execution Terminal (Educational & Sandbox)"
 )
+
+app.include_router(dhan_router)
+app.include_router(signals_router)
 
 app.add_middleware(
     CORSMiddleware,
@@ -432,6 +440,14 @@ async def get_shoonya_paper_trades():
 async def get_shoonya_profit_log():
     return shoonya_service.local_profit_log
 
+@app.get("/api/shoonya/positions")
+async def get_shoonya_positions():
+    return shoonya_client.get_positions()
+
+@app.get("/api/shoonya/holdings")
+async def get_shoonya_holdings():
+    return shoonya_client.get_holdings()
+
 @app.post("/api/shoonya/trade/close")
 async def close_shoonya_trade(req: ShoonyaCloseTradeRequest):
     res = shoonya_service.close_trade(req.trade_id, req.exit_price, req.reason or "MANUAL_EXIT")
@@ -476,17 +492,91 @@ async def feed_shoonya_token(req: FeedTokenRequest):
 
 @app.get("/api/health")
 async def get_system_health():
-    """Returns actual operational status of all platform services"""
+    """Single source of truth for platform connectivity"""
+    import requests
+    shoonya_test = shoonya_client.test_connection()
+    dhan_test = dhan_client.test_connection()
+    
+    # Check supabase by running trivial select on network_table
+    sb_ok = False
+    try:
+        url = f"{settings.SUPABASE_URL}/rest/v1/network_table?select=id&limit=1"
+        headers = {"apikey": settings.SUPABASE_KEY, "Authorization": f"Bearer {settings.SUPABASE_KEY}"}
+        r = requests.get(url, headers=headers, timeout=4)
+        sb_ok = (r.status_code == 200)
+    except Exception:
+        sb_ok = False
+
     return {
-        "status": "operational",
-        "timestamp": time.time(),
-        "services": {
-            "api_server": {"status": "operational", "latency_ms": 5},
-            "market_feed": {"status": "operational", "provider": "Yahoo Finance Realtime & WebSocket", "latency_ms": 120},
-            "database": {"status": "operational" if supabase_manager.is_connected else "degraded", "provider": "Supabase Cloud Vault"},
-            "shoonya_broker": {"status": "operational" if shoonya_service.is_connected else "ready", "provider": "Shoonya Finvasia"},
-            "dhan_broker": {"status": "operational" if dhan_service.is_connected else "ready", "provider": "Dhan HQ Open API v2"}
+        "shoonya": shoonya_test.get("success", False),
+        "dhan": dhan_test.get("success", False),
+        "supabase": sb_ok,
+        "details": {
+            "shoonya": shoonya_test.get("data", {}).get("status", "Disconnected"),
+            "dhan": dhan_test.get("data", {}).get("status", "Disconnected"),
+            "supabase": "Connected" if sb_ok else "Disconnected",
+            "timestamp": time.time()
         }
+    }
+
+class ShoonyaOrderRequest(BaseModel):
+    symbol: str
+    exchange: str = "NSE"
+    side: str = "BUY"
+    quantity: int = 1
+    order_type: str = "MKT"
+    price: float = 0.0
+    trigger_price: float = 0.0
+    mode: Optional[str] = "PAPER"
+
+@app.post("/api/orders/shoonya")
+async def place_shoonya_order(req: ShoonyaOrderRequest):
+    """Paper vs Live trading execution route"""
+    active_mode = (req.mode or settings.DEFAULT_TRADING_MODE).upper()
+    if active_mode == "LIVE":
+        res = shoonya_client.place_order(
+            symbol=req.symbol,
+            exchange=req.exchange,
+            side=req.side,
+            quantity=req.quantity,
+            order_type=req.order_type,
+            price=req.price,
+            trigger_price=req.trigger_price
+        )
+        return {"mode": "LIVE", "result": res}
+    else:
+        # Paper execution
+        paper_order = {
+            "Symbol": req.symbol,
+            "Side": req.side,
+            "Quantity": req.quantity,
+            "Price": req.price or 100.0,
+            "Status": "OPEN",
+            "Mode": "PAPER",
+            "Timestamp": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        }
+        try:
+            supabase_manager.insert_paper_trade(paper_order)
+        except Exception:
+            pass
+        return {"mode": "PAPER", "success": True, "order": paper_order}
+
+@app.post("/api/scanner/start")
+async def start_scanner_endpoint():
+    return scanner_engine.start()
+
+@app.post("/api/scanner/stop")
+async def stop_scanner_endpoint():
+    return scanner_engine.stop()
+
+@app.get("/api/scanner/status")
+async def get_scanner_status_endpoint():
+    return {
+        "running": scanner_engine.is_running,
+        "interval_seconds": scanner_engine.interval_seconds,
+        "last_scan_time": scanner_engine.last_scan_time,
+        "signals_fired_count": scanner_engine.signals_fired_count,
+        "watchlist_size": len(scanner_engine.watchlist)
     }
 
 @app.post("/api/shoonya/exchange-oauth")
@@ -654,6 +744,7 @@ async def start_background_workers():
             await asyncio.sleep(1.0)
             
     asyncio.create_task(price_streaming_loop())
+    asyncio.create_task(start_dhan_portfolio_polling_task())
 
 
 # Mount Frontend static files
